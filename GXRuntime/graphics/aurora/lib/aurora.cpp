@@ -317,7 +317,13 @@ void end_frame() noexcept {
       if (!g_presentSuppressed.load(std::memory_order_relaxed) && window::is_presentable() && g_surface) {
         ZoneScopedN("Acquire texture");
         wgpu::SurfaceTexture surfaceTexture;
+        const auto acquireStart = std::chrono::steady_clock::now();
         g_surface.GetCurrentTexture(&surfaceTexture);
+        const auto acquireMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() - acquireStart)
+                                   .count();
+        if (acquireMs >= 30)
+          std::fprintf(stderr, "[render-slow] acquire-drawable ms=%lld\n", static_cast<long long>(acquireMs));
         surfaceStatus = surfaceTexture.status;
         if (surfaceStatus == wgpu::SurfaceGetCurrentTextureStatus::SuccessOptimal) {
           currentTexture = std::move(surfaceTexture.texture);
@@ -401,7 +407,13 @@ void end_frame() noexcept {
       {
         window::SurfaceLock surfaceLock;
         if (window::is_presentable()) {
+          const auto presentStart = std::chrono::steady_clock::now();
           status = g_surface.Present();
+          const auto presentMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::steady_clock::now() - presentStart)
+                                     .count();
+          if (presentMs >= 30)
+            std::fprintf(stderr, "[render-slow] present ms=%lld\n", static_cast<long long>(presentMs));
         }
       }
       if (status) {

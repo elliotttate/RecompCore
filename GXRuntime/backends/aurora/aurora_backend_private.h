@@ -51,6 +51,7 @@ extern u32 g_audio_sample_rate;
 extern SDL_AudioStream* g_audio_stream;
 extern bool g_audio_playing;
 extern std::atomic_bool g_audio_discard;
+extern bool g_hold_redraw;
 extern int g_audio_prebuffer_ms;
 extern int g_audio_max_queue_ms;
 extern DolPlatformGuestAddressResolverFn g_guest_address_resolver;

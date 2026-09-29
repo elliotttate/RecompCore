@@ -1936,7 +1936,10 @@ void after_submit() noexcept {
 
 void gpu_synchronize() { render_worker::synchronize(); }
 
+static std::atomic<unsigned long long> g_shownFrames{0};
+
 void after_present() noexcept {
+  g_shownFrames.fetch_add(1, std::memory_order_relaxed);
   const auto now = PresentClock::now();
   const int64_t nowNs = timestamp_ns(now);
   const int64_t previousPresentNs = g_lastPresentNs.exchange(nowNs, std::memory_order_acq_rel);
@@ -2234,3 +2237,7 @@ bool aurora_peek_z(uint16_t x, uint16_t y, uint32_t* z) {
   return true;
 }
 float aurora_get_fps() { return aurora::gfx::calculate_fps(); }
+
+unsigned long long aurora_get_shown_frames(void) {
+  return aurora::gfx::g_shownFrames.load(std::memory_order_relaxed);
+}

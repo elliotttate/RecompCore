@@ -27,6 +27,7 @@ void* g_host_overlay_user = nullptr;
 DolAuroraEventObserverFn g_host_event_observer = nullptr;
 void* g_host_event_user = nullptr;
 DolAuroraHoldFn g_host_hold = nullptr;
+bool g_hold_redraw = false;
 void* g_host_hold_user = nullptr;
 bool g_graphics_log = false;
 bool g_force_untextured = false;
@@ -507,6 +508,8 @@ void dol_aurora_set_fast_forward(bool on) {
     gx_aurora::g_audio_discard.store(on, std::memory_order_relaxed);
     aurora_set_present_suppressed(on);
 }
+
+void dol_aurora_set_hold_redraw(bool redraw) { gx_aurora::g_hold_redraw = redraw; }
 
 void dol_aurora_set_hold(DolAuroraHoldFn should_hold, void* user) {
     gx_aurora::g_host_hold = should_hold;

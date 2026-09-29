@@ -514,10 +514,21 @@ void g_fifo_worker_main() {
         const long ms = static_cast<long>(std::chrono::duration_cast<std::chrono::milliseconds>(
                                               std::chrono::steady_clock::now() - t0)
                                               .count());
-        if (slow_ms > 0 && ms >= slow_ms)
+        if (slow_ms > 0 && ms >= slow_ms) {
             std::fprintf(stderr, "[gx-slow] batch_ms=%ld bytes=%zu pipelines=%u textures=%llu\n", ms,
                          batch.size(), aurora_get_stats()->createdPipelines - pipelines0,
                          aurora::gfx::gxcore::texture_upload_count() - uploads0);
+            // A batch that held the game for a tenth of a second or more: its
+            // first bytes (the GX commands), so what it waited on can be told.
+            if (ms >= 100) {
+                char hex[3 * 256 + 1];
+                size_t n = 0;
+                for (size_t i = 0; i < batch.size() && i < 256; ++i)
+                    n += static_cast<size_t>(std::snprintf(hex + n, sizeof hex - n, "%02X ", batch[i]));
+                hex[n] = '\0';
+                std::fprintf(stderr, "[gx-slow-bytes] %s\n", hex);
+            }
+        }
         {
             std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
             g_fifo_parsed = parsed;
@@ -1177,6 +1188,14 @@ void dol_aurora_frame_timing(DolAuroraFrameTiming* out) {
     out->draws = gx_aurora::g_timing_draws;
     out->audio_throttles = gx_aurora::g_audio_throttle_count;
     out->audio_dropped = gx_aurora::g_audio_dropped_count;
+    out->shown = aurora_get_shown_frames();
+    AuroraFrameInterpTotals interp{};
+    aurora_get_frame_interp_totals(&interp);
+    out->interp_frames = interp.frames;
+    out->interp_interpolated = interp.interpolated;
+    out->interp_draws = interp.draws;
+    out->interp_rejected = interp.rejected;
+    out->interp_unmatched = interp.unmatched;
     out->audio_queued_ms = 0;
     if (gx_aurora::g_audio_stream != nullptr && gx_aurora::g_audio_sample_rate != 0u) {
         const int queued = SDL_GetAudioStreamQueued(gx_aurora::g_audio_stream);
@@ -1458,7 +1477,16 @@ static void aurora_backend_present_impl(void) {
         std::fprintf(stderr, "[gfx] guest held by the host at present=%llu\n",
                      gx_aurora::g_present_count);
         while (!gx_aurora::g_should_quit && gx_aurora::host_wants_hold()) {
-            SDL_Delay(16);
+            // dol_aurora_set_hold_redraw: a frame with no game drawing presents
+            // the last picture, and the host overlay (a menu) is drawn over
+            // it. The worker records nothing meanwhile (recording is closed
+            // until the begin_frame below) and the display paces the loop.
+            if (gx_aurora::g_hold_redraw && aurora_begin_frame()) {
+                gx_aurora::run_host_overlay();
+                aurora_end_frame();
+            } else {
+                SDL_Delay(16);
+            }
             gx_aurora::poll_events();
         }
         std::fprintf(stderr, "[gfx] guest released after %.1f s\n",

@@ -159,6 +159,17 @@ void aurora_set_frame_interpolation(bool enabled);
    the starting value. */
 void aurora_set_fps_overlay(bool enabled);
 bool aurora_get_frame_interpolation(void);
+/* Frames presented to the window so far, in-between frames included (what
+   the frames-a-second counter counts). */
+unsigned long long aurora_get_shown_frames(void);
+/* The in-between frames' running totals: game frames seen and interpolated,
+   and their draws, the ones rejected as implausible and those with no
+   counterpart in the frame before. Differences between two reads cover the
+   interval. */
+typedef struct AuroraFrameInterpTotals {
+  unsigned long long frames, interpolated, draws, rejected, unmatched;
+} AuroraFrameInterpTotals;
+void aurora_get_frame_interp_totals(AuroraFrameInterpTotals* out);
 
 AuroraBackend aurora_get_backend();
 const AuroraBackend* aurora_get_available_backends(size_t* count);
