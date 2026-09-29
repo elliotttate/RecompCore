@@ -203,6 +203,10 @@ int dolgx_replay_core_main(const char* trace_path,
 
   gxc::GxCoreSink sink;
   sink.set_guest_resolver(&frontend.state().resolver);
+  sink.set_packed_vertex_policy([] {
+    const char *value = std::getenv("DOL_GXCORE_GPU_VERTICES");
+    return value && std::strcmp(value, "1") == 0;
+  });
   sink.set_plan_observer(plan_observer, &ctx);
   sink.set_copy_observer(copy_observer, &ctx);
 

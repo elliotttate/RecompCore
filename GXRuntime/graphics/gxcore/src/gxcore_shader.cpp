@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "gxruntime/gxcore/shader.hpp"
+#include "gxruntime/gxcore/vertex_layout.hpp"
 
 #include <cstdarg>
 #include <cstdio>
@@ -37,6 +38,119 @@ void emitf(std::string& out, const char* fmt, ...) {
   std::vsnprintf(buffer, sizeof buffer, fmt, args);
   va_end(args);
   out += buffer;
+}
+
+std::string packed_component(const WalkEntry &e, unsigned offset) {
+  const unsigned size = e.format < 2 ? 1 : e.format < 4 ? 2 : 4;
+  std::string value = "packed_be(base+" + std::to_string(offset) + "u," +
+                      std::to_string(size) + "u)";
+  if (e.format == 4)
+    return "bitcast<f32>(" + value + ")";
+  if (e.format == 1 || e.format == 3) {
+    const auto shift = std::to_string(32 - size * 8);
+    value = "(bitcast<i32>(" + value + "<<" + shift + "u)>>" + shift + "u)";
+  }
+  return "(f32(" + value + ")/" + std::to_string(std::uint64_t(1) << e.frac) +
+         ".0)";
+}
+
+void emit_packed_fetch(std::string &out, const ShaderKey &key, bool normal,
+                       bool binormal, bool tangent) {
+  std::uint32_t words[5];
+  std::memcpy(words, key.packed_format, sizeof(words));
+  WalkLayout walk;
+  if (!derive_vertex_layout(words[0], words[1], words + 2, walk))
+    return;
+  emitf(out, "    let base=vertex_index*%uu;\n", key.packed_stride);
+  emit(out, "    var in: VertexIn;\n    in.rawcolor0=vec4f(1.0);\n    "
+            "in.rawcolor1=vec4f(1.0);\n");
+  unsigned offset = 0, normal_part = 0;
+  for (unsigned i = 0; i < walk.entry_count; ++i) {
+    const auto &e = walk.entries[i];
+    if (e.kind == WalkEntry::kPosMtxIdx) {
+      emitf(out, "    in.posmtx=packed_be(base+%uu,1u);\n", offset++);
+      continue;
+    }
+    if (e.kind == WalkEntry::kTexMtxIdx) {
+      if (e.out_slot < 4 || (key.tex_mtx_idx_mask & 0xF0u))
+        emitf(out, "    in.%s|=packed_be(base+%uu,1u)<<%uu;\n",
+              e.out_slot < 4 ? "texmtxidx" : "texmtxidx_hi", offset,
+              8 * (e.out_slot % 4));
+      ++offset;
+      continue;
+    }
+    const unsigned scalar = e.format < 2 ? 1 : e.format < 4 ? 2 : 4;
+    if (e.kind == WalkEntry::kPos || e.kind == WalkEntry::kTex) {
+      if (e.kind == WalkEntry::kPos || e.out_slot < kMaxTexGens) {
+        const auto field = e.kind == WalkEntry::kPos
+                               ? "rawpos"
+                               : "rawtex" + std::to_string(e.out_slot);
+        for (unsigned c = 0; c < e.count; ++c)
+          emitf(out, "    in.%s[%u]=%s;\n", field.c_str(), c,
+                packed_component(e, offset + c * scalar).c_str());
+      }
+    } else if (e.kind == WalkEntry::kNormal) {
+      for (unsigned c = 0; c < e.count; ++c) {
+        unsigned part = normal_part + c / 3;
+        if ((part == 0 && normal) || (part == 1 && binormal) ||
+            (part == 2 && tangent))
+          emitf(out, "    in.%s[%u]=%s;\n",
+                part == 0   ? "rawnormal"
+                : part == 1 ? "rawbinormal"
+                            : "rawtangent",
+                c % 3, packed_component(e, offset + c * scalar).c_str());
+      }
+      normal_part += e.count / 3;
+    } else if (e.kind == WalkEntry::kColor) {
+      unsigned widths[4] = {8, 8, 8, 8}, shifts[4] = {24, 16, 8, 0};
+      unsigned bytes = e.element_size;
+      if (e.format == 0) {
+        widths[0] = 5;
+        widths[1] = 6;
+        widths[2] = 5;
+        widths[3] = 0;
+        shifts[0] = 11;
+        shifts[1] = 5;
+        shifts[2] = 0;
+      }
+      if (e.format == 1) {
+        widths[3] = 0;
+        shifts[0] = 16;
+        shifts[1] = 8;
+        shifts[2] = 0;
+      }
+      if (e.format == 2)
+        widths[3] = 0;
+      if (e.format == 3)
+        for (unsigned c = 0; c < 4; ++c) {
+          widths[c] = 4;
+          shifts[c] = 12 - 4 * c;
+        }
+      if (e.format == 4)
+        for (unsigned c = 0; c < 4; ++c) {
+          widths[c] = 6;
+          shifts[c] = 18 - 6 * c;
+        }
+      emitf(out, "    let color%u=packed_be(base+%uu,%uu);\n", e.out_slot,
+            offset, bytes);
+      for (unsigned c = 0; c < 4; ++c) {
+        const auto width = widths[c];
+        if (!width)
+          continue;
+        auto value = "((color" + std::to_string(e.out_slot) + ">>" +
+                     std::to_string(shifts[c]) + "u)&" +
+                     std::to_string((1u << width) - 1) + "u)";
+        if (width == 4)
+          value = "(" + value + "*17u)";
+        if (width == 5 || width == 6)
+          value = "((" + value + "<<" + std::to_string(8 - width) + "u)|(" +
+                  value + ">>" + std::to_string(2 * width - 8) + "u))";
+        emitf(out, "    in.rawcolor%u[%u]=f32(%s)/255.0;\n", e.out_slot, c,
+              value.c_str());
+      }
+    }
+    offset += e.element_size;
+  }
 }
 
 void emit_fragment_entry(std::string& out, const ShaderKey& key) {
@@ -885,6 +999,7 @@ std::string generate_wgsl(const ShaderKey& key) {
     }
   }
 
+  const auto vertex_struct_start = out.size();
   // Fixed vertex input layout (kVertexStrideBytes); unused inputs are ignored.
   emit(out, "struct VertexIn {\n"
             "    @location(0) rawpos: vec3f,\n"
@@ -909,6 +1024,26 @@ std::string generate_wgsl(const ShaderKey& key) {
     emit(out, "    @location(13) texmtxidx_hi: u32,\n");
   emit(out, "};\n");
 
+  if (key.packed_stride) {
+    // The same logical input struct becomes a local variable populated by the
+    // raw storage fetch; it is no longer the vertex entry point's input ABI.
+    for (auto at = out.find("@location(", vertex_struct_start);
+         at != std::string::npos; at = out.find("@location(", at)) {
+      const auto end = out.find(") ", at);
+      out.erase(at, end + 2 - at);
+    }
+    emit(
+        out,
+        "@group(0) @binding(0) var<storage,read> packed_vertices: array<u32>;\n"
+        "fn packed_be(address:u32,count:u32)->u32 {\n"
+        "    var value=0u;\n"
+        "    for(var i=0u;i<count;i+=1u) {\n"
+        "        let p=address+i;\n"
+        "        "
+        "value=(value<<8u)|((packed_vertices[p>>2u]>>((p&3u)*8u))&255u);\n"
+        "    }\n    return value;\n}\n");
+  }
+
   emit(out, "struct VertexOut {\n"
             "    @builtin(position) pos: vec4f,\n"
             "    @location(0) color0: vec4f,\n");
@@ -925,8 +1060,17 @@ std::string generate_wgsl(const ShaderKey& key) {
   if (chan1_lit)
     emit_lighting_chan(out, key, 1u);
 
-  emit(out, "@vertex\nfn vs_main(in: VertexIn) -> VertexOut {\n"
-            "    var o: VertexOut;\n");
+  if (key.packed_stride) {
+    emit(out, "@vertex\nfn vs_main(@builtin(vertex_index) vertex_index:u32) -> "
+              "VertexOut {\n");
+    emit_packed_fetch(out, key,
+                      (lit || emit_nbt || has_normal_source) && has_normal,
+                      emit_nbt && has_binormal, emit_nbt && has_tangent);
+    emit(out, "    var o: VertexOut;\n");
+  } else {
+    emit(out, "@vertex\nfn vs_main(in: VertexIn) -> VertexOut {\n"
+              "    var o: VertexOut;\n");
+  }
   if (key.has_pos_mtx_idx != 0) {
     emit(out, "    let posidx = i32(in.posmtx);\n"
               "    let p0 = vsc.transformmatrices[posidx];\n"

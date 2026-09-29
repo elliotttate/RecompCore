@@ -182,7 +182,18 @@ wgpu::SamplerDescriptor sampler_descriptor(const gxc::PlanSampler& sampler) {
 // t occupies binding 2t (texture) + 2t+1 (sampler), matching the WGSL. Cached per
 // mask; used_mask=1 (texmap 0 only) reproduces the pre-Mfin single-texmap layout.
 wgpu::BindGroupLayout texture_bind_group_layout(uint32_t used_mask = 1u) {
+  // Both the pipeline compiler and FIFO submission use this cache. A lookup
+  // concurrent with flat_hash_map growth can read an invalid layout handle.
+  static std::mutex mutex;
+  std::lock_guard lock{mutex};
   static absl::flat_hash_map<uint32_t, wgpu::BindGroupLayout> cache;
+  // Retaining the owner also prevents pointer reuse from matching a dead
+  // device after renderer reinitialization.
+  static wgpu::Device owner;
+  if (owner.Get() != g_device.Get()) {
+    cache.clear();
+    owner = g_device;
+  }
   auto it = cache.find(used_mask);
   if (it != cache.end())
     return it->second;
@@ -615,8 +626,8 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
           wgpu::VertexState{
               .module = module,
               .entryPoint = "vs_main",
-              .bufferCount = 1,
-              .buffers = &vertexLayout,
+              .bufferCount = key.shader.packed_stride ? 0u : 1u,
+              .buffers = key.shader.packed_stride ? nullptr : &vertexLayout,
           },
       .primitive =
           wgpu::PrimitiveState{
@@ -652,12 +663,13 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   const auto& vsGroup = blended ? g_interpUniformBindGroup : g_uniformBindGroup;
   const std::array vsOffsets{blended ? interpRange.offset : data.uniformRange.offset};
   pass.SetBindGroup(1, vsGroup, vsOffsets.size(), vsOffsets.data());
-  pass.SetVertexBuffer(0, g_vertexBuffer, data.vertRange.offset,
-                       data.vertRange.size);
+  if (!data.packedVertices)
+    pass.SetVertexBuffer(0, g_vertexBuffer, data.vertRange.offset, data.vertRange.size);
+  const int32_t baseVertex = data.packedVertices ? data.vertRange.offset / data.vertexStride : 0;
   pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16,
                       data.idxRange.offset, data.idxRange.size);
   if (data.depthPipeline != 0) {
-    pass.DrawIndexed(data.indexCount);
+    pass.DrawIndexed(data.indexCount, 1, 0, baseVertex);
     if (!bind_pipeline(data.pipeline, pass))
       return;
     pass.SetBindGroup(1, vsGroup, vsOffsets.size(), vsOffsets.data());
@@ -674,7 +686,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   } else if (data.textureBindGroup != 0) {
     pass.SetBindGroup(2, find_bind_group(data.textureBindGroup));
   }
-  pass.DrawIndexed(data.indexCount);
+  pass.DrawIndexed(data.indexCount, 1, 0, baseVertex);
 }
 
 void note_frame_presented() {
@@ -1347,7 +1359,10 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   }
 
   const bool tev = plan.pipeline.shader.tev_valid != 0;
-  const size_t vertBytes = plan.vertices.size() * sizeof(float);
+  const bool packed = !plan.packed_vertices.empty();
+  const uint32_t vertexStride = packed ? plan.pipeline.shader.packed_stride : gxc::kVertexStrideBytes;
+  const size_t vertexAlignment = packed ? vertexStride : 4u;
+  const size_t vertBytes = packed ? plan.packed_vertices.size() : plan.vertices.size() * sizeof(float);
   const size_t indexBytes = plan.indices.size() * sizeof(uint16_t);
   const size_t pixelUniformBytes = tev ? sizeof(plan.pixel_constants) : 0;
   // One comparison for the three de-duplications below (the vertex block, the
@@ -1385,22 +1400,18 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                  interpConstants ? interpConstants->transformmatrices[1][3] - plan.constants.transformmatrices[1][3] : 0.f,
                  interpConstants ? interpConstants->transformmatrices[2][3] - plan.constants.transformmatrices[2][3] : 0.f);
   }
-  if (!staging_has_capacity(vertBytes, indexBytes, sizeof(plan.constants),
-                            pixelUniformBytes)) {
+  if (!staging_has_capacity(vertBytes + vertexAlignment - 4, indexBytes, sizeof(plan.constants), pixelUniformBytes)) {
     if (!segment_frame() ||
-        !staging_has_capacity(vertBytes, indexBytes, sizeof(plan.constants),
-                              pixelUniformBytes)) {
+        !staging_has_capacity(vertBytes + vertexAlignment - 4, indexBytes, sizeof(plan.constants), pixelUniformBytes)) {
       Log.error("GXCore draw exceeds an empty Aurora staging segment");
       return false;
     }
   }
 
-  const auto vertRange = push_verts(
-      reinterpret_cast<const uint8_t*>(plan.vertices.data()),
-      vertBytes, 4);
-  const auto idxRange = push_indices(
-      reinterpret_cast<const uint8_t*>(plan.indices.data()),
-      indexBytes, 4);
+  const auto vertRange =
+      push_verts(packed ? plan.packed_vertices.data() : reinterpret_cast<const uint8_t*>(plan.vertices.data()),
+                 vertBytes, vertexAlignment);
+  const auto idxRange = push_indices(reinterpret_cast<const uint8_t*>(plan.indices.data()), indexBytes, 2);
   const auto uniformRange = push_uniform_dedup(
       g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants),
       sizeof(plan.constants), repeatsLast ? 1 : 0);
@@ -1432,7 +1443,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     depthConfig.depthOnly = 1u;
     depthPipeline = pipeline_ref(depthConfig);
   }
-  push_draw_command(DrawData{
+  DrawData data{
       .pipeline = pipeline_ref(colorConfig),
       .depthPipeline = depthPipeline,
       .vertRange = vertRange,
@@ -1442,9 +1453,30 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .interpJob = interpJob,
       .pixelUniformRange = pixelUniformRange,
       .indexCount = static_cast<uint32_t>(plan.indices.size()),
+      .vertexStride = vertexStride,
+      .packedVertices = packed,
       .textureBindGroup = textureBindGroup,
       .tev = tev,
-  });
+  };
+  static const bool merge_enabled = [] {
+    const char* value = std::getenv("DOL_GXCORE_DRAW_MERGE");
+    return !value || std::strcmp(value, "0") != 0;
+  }();
+  DrawData* previous = get_last_draw_command<DrawData>();
+  // Preserve primitive order, pass boundaries, uniforms and texture identity.
+  // Early-Z prepasses cannot merge: doing both depth passes before both color
+  // passes would change inter-draw visibility. Viewport/scissor commands also
+  // break adjacency through get_last_draw_command.
+  if (merge_enabled && previous && can_merge_draws(*previous, data)) {
+    const auto base = static_cast<uint16_t>(previous->vertRange.size / vertexStride);
+    rebase_indices_u16(data.idxRange, base);
+    previous->vertRange.size += data.vertRange.size;
+    previous->idxRange.size += data.idxRange.size;
+    previous->indexCount += data.indexCount;
+    ++g_mergedDrawCallCount;
+  } else {
+    push_draw_command(data);
+  }
   return true;
 }
 

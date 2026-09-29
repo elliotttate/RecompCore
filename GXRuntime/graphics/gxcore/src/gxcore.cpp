@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "gxruntime/gxcore/gxcore.hpp"
 #include "gxruntime/gxcore/shader.hpp"
+#include "gxruntime/gxcore/vertex_layout.hpp"
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -178,24 +181,6 @@ namespace {
 
 // One payload element in GC attribute order. attr uses CP array numbering
 // (0 pos, 1 nrm, 2/3 colors, 4-11 tex); matrix-index bytes use kMatIdx.
-struct WalkEntry {
-  enum Kind : std::uint8_t {
-    kPosMtxIdx,
-    kTexMtxIdx,
-    kPos,
-    kNormal,
-    kColor,
-    kTex,
-  };
-  Kind kind = kPos;
-  std::uint8_t attr = 0;      // CP array index for indexed fetch
-  std::uint8_t vcd_type = 0;  // 1 direct, 2 idx8, 3 idx16
-  std::uint8_t format = 0;    // ComponentFormat / ColorFormat
-  std::uint8_t count = 0;     // components (pos 2/3, tex 1/2, normal 3/9)
-  std::uint8_t frac = 0;
-  std::uint8_t out_slot = 0;  // color: 0/1; tex: 0-7
-  std::uint32_t element_size = 0; // bytes of one element in the source array
-};
 
 bool component_scalar_size(std::uint32_t format, std::uint32_t* out) {
   switch (format) {
@@ -234,18 +219,6 @@ bool color_element_size(std::uint32_t format, std::uint32_t* out) {
   }
 }
 
-struct WalkLayout {
-  WalkEntry entries[24];
-  std::uint32_t entry_count = 0;
-  std::uint32_t vertex_size = 0;
-  bool has_pos_mtx_idx = false;
-  bool has_tex_mtx_idx = false;
-  bool has_normal = false;
-  bool has_nbt = false; // normal attr carries binormal+tangent (emboss inputs)
-  bool has_color[2] = {false, false};
-  std::uint8_t uv_mask = 0;          // tex0-7 presence
-  std::uint8_t tex_mtx_idx_mask = 0; // per-vertex TEXMTXIDX per texgen (0..4)
-};
 
 // Derive the payload walk from raw VCD/VAT (CPMemory.h bit positions).
 bool derive_walk(std::uint32_t vcd_lo, std::uint32_t vcd_hi,
@@ -320,8 +293,9 @@ bool derive_walk(std::uint32_t vcd_lo, std::uint32_t vcd_hi,
                       .format = static_cast<std::uint8_t>(format),
                       .count = static_cast<std::uint8_t>(elements),
                       .frac = static_cast<std::uint8_t>(nfrac),
-                      .element_size = nbt && index3 ? 3u * scalar
-                                                    : elements * scalar};
+                      .element_size = type != 1u && nbt && index3
+                                          ? 3u * scalar
+                                          : elements * scalar};
       if (type == 1u) {
         add(entry, elements * scalar);
       } else if (nbt && index3) {
@@ -562,11 +536,17 @@ void identity_rows(float rows[3][4]) {
 
 } // namespace
 
-DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
-                                      GapCounters& counters,
-                                      CachedVertexAttrs* cached) const {
+bool derive_vertex_layout(std::uint32_t lo, std::uint32_t hi,
+                          const std::uint32_t vat[3], WalkLayout &out) {
+  return derive_walk(lo, hi, vat, out);
+}
+
+DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw &draw,
+                                      GapCounters &counters,
+                                      CachedVertexAttrs *cached,
+                                      bool packed_vertices) const {
   DrawPlan plan;
-  build_draw_plan_into(draw, counters, cached, plan);
+  build_draw_plan_into(draw, counters, cached, plan, packed_vertices);
   return plan;
 }
 
@@ -574,17 +554,21 @@ DrawPlan GxCoreState::build_draw_plan(const ar::ConsumedDraw& draw,
 // per draw (about 20,000 a frame on Wind Waker's title), and returning a fresh
 // DrawPlan allocated and freed its vertex and index arrays every time; reusing
 // one object keeps their capacity. Every other field is reset to its default.
-void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
-                                       GapCounters& counters,
-                                       CachedVertexAttrs* cached,
-                                       DrawPlan& plan) const {
+void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw &draw,
+                                       GapCounters &counters,
+                                       CachedVertexAttrs *cached,
+                                       DrawPlan &plan,
+                                       bool packed_vertices) const {
   {
     std::vector<float> vertices = std::move(plan.vertices);
+    auto packed = std::move(plan.packed_vertices);
     std::vector<std::uint16_t> indices = std::move(plan.indices);
     plan = DrawPlan{};
     vertices.clear();
+    packed.clear();
     indices.clear();
     plan.vertices = std::move(vertices);
+    plan.packed_vertices = std::move(packed);
     plan.indices = std::move(indices);
   }
   plan.match_payload = draw.vertex_payload.data();
@@ -642,8 +626,23 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
   }
 
   // Payload walk from raw VCD/VAT.
-  WalkLayout walk;
-  if (!derive_walk(vcd_lo_, vcd_hi_, vat_[draw.vtx_fmt], walk)) {
+  struct WalkCacheEntry {
+    std::array<std::uint32_t, 5> key{};
+    WalkLayout walk{};
+    bool valid = false;
+  };
+  static thread_local std::array<WalkCacheEntry, 16> walk_cache{};
+  const std::array walk_key{vcd_lo_, vcd_hi_, vat_[draw.vtx_fmt][0],
+                            vat_[draw.vtx_fmt][1], vat_[draw.vtx_fmt][2]};
+  auto &entry = walk_cache[(vcd_lo_ ^ vcd_hi_ ^ vat_[draw.vtx_fmt][0] ^
+                            vat_[draw.vtx_fmt][1] ^ vat_[draw.vtx_fmt][2]) %
+                           walk_cache.size()];
+  if (!entry.valid || entry.key != walk_key) {
+    entry.valid = derive_walk(vcd_lo_, vcd_hi_, vat_[draw.vtx_fmt], entry.walk);
+    entry.key = walk_key;
+  }
+  const WalkLayout &walk = entry.walk;
+  if (!entry.valid) {
     ++counters.vertex_decode_failures;
     ++counters.vertex_walk_underivable;
     return skip("VCD/VAT walk underivable");
@@ -654,407 +653,503 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     ++counters.vertex_stride_mismatch;
     return skip("walk stride != frontend stride");
   }
-  // Shader key.
-  ShaderKey& key = plan.pipeline.shader;
-  const std::uint32_t xf_numtexgens_reg = 0x103Fu - 0x1018u;
-  std::uint32_t num_tex_gens = 0;
-  if (draw.xf_reg_mask & (1ull << xf_numtexgens_reg))
-    num_tex_gens = draw.xf_regs[xf_numtexgens_reg] & 0xFu;
-  else
-    num_tex_gens = bits(gen_mode, 4, 0);
-  if (num_tex_gens == 5u)
-    ++counters.texgen_count_5;
-  else if (num_tex_gens == 6u)
-    ++counters.texgen_count_6;
-  else if (num_tex_gens == 7u)
-    ++counters.texgen_count_7;
-  else if (num_tex_gens >= 8u)
-    ++counters.texgen_count_8plus;
-  if (num_tex_gens > kMaxTexGens) {
-    ++counters.unsupported_texgen;
-    ++counters.texgen_count_overflow;
-    num_tex_gens = kMaxTexGens;
-  }
-  key.num_tex_gens = static_cast<std::uint8_t>(num_tex_gens);
-  key.has_pos_mtx_idx = walk.has_pos_mtx_idx ? 1u : 0u;
-  key.has_tex_mtx_idx = walk.has_tex_mtx_idx ? 1u : 0u;
-  key.tex_mtx_idx_mask = walk.tex_mtx_idx_mask;
-  key.has_color0 = walk.has_color[0] ? 1u : 0u;
-  key.has_color1 = walk.has_color[1] ? 1u : 0u;
-  key.uv_mask = static_cast<std::uint8_t>(
-      walk.uv_mask & ((1u << kMaxTexGens) - 1u));
-  // Vertex-format N/B/T presence (GC packs all three in one NBT attribute, so
-  // binormal/tangent presence follows has_nbt). A lit/emboss draw that omits
-  // one substitutes the cached fallback from the uniform instead of a
-  // per-vertex input (Dolphin I_CACHED_NORMAL, populated below from the last
-  // decoded vertex of a draw that DID carry the attribute).
-  key.has_vertex_normal = walk.has_normal ? 1u : 0u;
-  key.has_vertex_binormal = walk.has_nbt ? 1u : 0u;
-  key.has_vertex_tangent = walk.has_nbt ? 1u : 0u;
-
-  // Lighting key (S15). LitChannel bitfields (XFMemory.h): matsource@0,
-  // enablelighting@1, lightMask0_3@2, ambsource@6, diffusefunc@7, attnfunc@9,
-  // lightMask4_7@11. chan_regs slot = xf_addr - 0x1009: [0]=numColorChans,
-  // [1..4]=amb0/amb1/mat0/mat1, [5..8]=color0/color1/alpha0/alpha1 ctrl.
-  auto lit_chan = [&](std::uint32_t slot, LightChanKey& ch) {
-    if ((draw.chan_reg_mask & (1u << slot)) == 0u)
-      return;
-    const std::uint32_t v = draw.chan_regs[slot];
-    ch.matsource = static_cast<std::uint8_t>(bits(v, 1, 0));
-    ch.enablelighting = static_cast<std::uint8_t>(bits(v, 1, 1));
-    ch.ambsource = static_cast<std::uint8_t>(bits(v, 1, 6));
-    ch.diffusefunc = static_cast<std::uint8_t>(bits(v, 2, 7));
-    ch.attnfunc = static_cast<std::uint8_t>(bits(v, 2, 9));
-    const std::uint32_t mask = bits(v, 4, 2) | (bits(v, 4, 11) << 4);
-    ch.light_mask = ch.enablelighting ? static_cast<std::uint8_t>(mask) : 0u;
+  // Cache only register-derived pipeline state. Geometry, mutable guest
+  // arrays, uniforms, texture bytes and cross-draw NBT remain live each draw.
+  // Thread-local storage keeps separate FIFO consumers independent; the key
+  // includes values, not object addresses or a reusable generation number.
+  struct DerivedCache {
+    std::array<std::uint8_t,
+               sizeof(bp_regs_) + sizeof(bp_valid_) + 20 +
+                   sizeof(draw.xf_regs) + sizeof(draw.xf_reg_mask) +
+                   sizeof(draw.chan_regs) + sizeof(draw.chan_reg_mask) +
+                   sizeof(draw.light_word_mask) + 9 * 6 * 4>
+        input{};
+    PipelineKey pipeline{};
+    GapCounters delta{};
+    bool valid = false;
+    unsigned long long hits = 0, misses = 0;
+    ~DerivedCache() {
+      if (std::getenv("DOL_GXCORE_OPT_LOG"))
+        std::fprintf(stderr, "[gx-derived] hits=%llu misses=%llu\n", hits,
+                     misses);
+    }
   };
-  lit_chan(5u, key.litchan[0]);
-  lit_chan(6u, key.litchan[1]);
-  lit_chan(7u, key.litchan[2]);
-  lit_chan(8u, key.litchan[3]);
-  // Record which channel-control regs were actually loaded (slots 5..8 map to
-  // litchan 0..3). A captured channel selecting MatSource::Register drives the
-  // material register; an unconfigured channel stays vertex-color passthrough.
-  for (std::uint32_t j = 0; j < 4u; ++j)
-    if (draw.chan_reg_mask & (1u << (5u + j)))
-      key.chan_captured_mask |= static_cast<std::uint8_t>(1u << j);
-  if (draw.chan_reg_mask & 0x1u) {
-    std::uint32_t n = bits(draw.chan_regs[0], 2, 0);
-    if (n > 2u)
-      n = 2u;
-    key.num_color_chans = static_cast<std::uint8_t>(n);
+  static thread_local DerivedCache derived;
+  static const bool cache_enabled = [] {
+    const char *value = std::getenv("DOL_GXCORE_DERIVED_CACHE");
+    return !value || std::strcmp(value, "0") != 0;
+  }();
+  decltype(derived.input) input{};
+  auto *cursor = input.data();
+  auto append = [&](const void *data, std::size_t size) {
+    std::memcpy(cursor, data, size);
+    cursor += size;
+  };
+  append(bp_regs_, sizeof(bp_regs_));
+  append(bp_valid_, sizeof(bp_valid_));
+  append(&vcd_lo_, 4);
+  append(&vcd_hi_, 4);
+  append(vat_[draw.vtx_fmt], 12);
+  append(draw.xf_regs, sizeof(draw.xf_regs));
+  append(&draw.xf_reg_mask, sizeof(draw.xf_reg_mask));
+  append(draw.chan_regs, sizeof(draw.chan_regs));
+  append(&draw.chan_reg_mask, sizeof(draw.chan_reg_mask));
+  append(draw.light_word_mask, sizeof(draw.light_word_mask));
+  auto texture_key = [&](const ar::ConsumedTexture &t) {
+    const std::uint32_t values[] = {t.valid,  t.resolved, t.slot,
+                                    t.format, t.width,    t.height};
+    append(values, sizeof(values));
+  };
+  texture_key(draw.texture);
+  for (const auto &t : draw.textures)
+    texture_key(t);
+  static constexpr auto counter_members = std::array{
+      &GapCounters::dst_alpha_active,
+      &GapCounters::early_depth_active,
+      &GapCounters::indirect_active,
+      &GapCounters::indirect_ignored,
+      &GapCounters::lighting_ignored,
+      &GapCounters::lit_light_missing,
+      &GapCounters::logic_op_ignored,
+      &GapCounters::normals_ignored,
+      &GapCounters::per_vertex_normal_matrix,
+      &GapCounters::tev_multi_texmap,
+      &GapCounters::texcoord_scale_active,
+      &GapCounters::texcoord_scale_mismatch,
+      &GapCounters::texgen_color_lit,
+      &GapCounters::texgen_color_unlit,
+      &GapCounters::texgen_count_5,
+      &GapCounters::texgen_count_6,
+      &GapCounters::texgen_count_7,
+      &GapCounters::texgen_count_8plus,
+      &GapCounters::texgen_count_overflow,
+      &GapCounters::texgen_emboss_cached_nbt,
+      &GapCounters::texgen_source_binormal,
+      &GapCounters::texgen_source_colors,
+      &GapCounters::texgen_source_normal,
+      &GapCounters::texgen_source_normal_default,
+      &GapCounters::texgen_source_tex47,
+      &GapCounters::texgen_source_unknown,
+      &GapCounters::tlut_texture,
+      &GapCounters::unsupported_texgen,
+      &GapCounters::ztexture_active,
+      &GapCounters::ztexture_ignored,
+  };
+  ShaderKey& key = plan.pipeline.shader;
+  PipelineKey &pipe = plan.pipeline;
+  if (cache_enabled && derived.valid && input == derived.input) {
+    plan.pipeline = derived.pipeline;
+    for (auto member : counter_members)
+      counters.*member += derived.delta.*member;
+    ++derived.hits;
   } else {
-    // numColorChans reg (XF 0x1009) never captured. GX games always program it;
-    // a 0 here is a capture artifact, not "no channels". Assume both channels
-    // present so the WGSL numColorChans gate never spuriously blacks a draw whose
-    // count we simply did not observe.
-    key.num_color_chans = 2u;
-  }
-  key.lit_valid = (key.litchan[0].enablelighting || key.litchan[1].enablelighting ||
-                    key.litchan[2].enablelighting || key.litchan[3].enablelighting)
-                      ? 1u
-                      : 0u;
-  if (key.has_pos_mtx_idx != 0u && key.lit_valid != 0u)
-    ++counters.per_vertex_normal_matrix;
-  for (std::uint32_t c = 0; c < 4u; ++c) {
-    const std::uint8_t mask = key.litchan[c].light_mask;
-    for (std::uint32_t l = 0; l < 8u; ++l)
-      if ((mask & (1u << l)) && draw.light_word_mask[l] == 0u) {
-        ++counters.lit_light_missing;
-        c = 4u;
-        break;
-      }
-  }
-  // Only count normals/lighting as ignored when we fall back to passthrough.
-  if (walk.has_normal && key.lit_valid == 0u)
-    ++counters.normals_ignored;
-  if (key.lit_valid == 0u && (draw.chan_reg_mask & (1u << 5)) &&
-      (draw.chan_regs[5] & 0x2u) != 0u)
-    ++counters.lighting_ignored;
+    GapCounters before = counters;
+    // Shader key.
+    const std::uint32_t xf_numtexgens_reg = 0x103Fu - 0x1018u;
+    std::uint32_t num_tex_gens = 0;
+    if (draw.xf_reg_mask & (1ull << xf_numtexgens_reg))
+      num_tex_gens = draw.xf_regs[xf_numtexgens_reg] & 0xFu;
+    else
+      num_tex_gens = bits(gen_mode, 4, 0);
+    if (num_tex_gens == 5u)
+      ++counters.texgen_count_5;
+    else if (num_tex_gens == 6u)
+      ++counters.texgen_count_6;
+    else if (num_tex_gens == 7u)
+      ++counters.texgen_count_7;
+    else if (num_tex_gens >= 8u)
+      ++counters.texgen_count_8plus;
+    if (num_tex_gens > kMaxTexGens) {
+      ++counters.unsupported_texgen;
+      ++counters.texgen_count_overflow;
+      num_tex_gens = kMaxTexGens;
+    }
+    key.num_tex_gens = static_cast<std::uint8_t>(num_tex_gens);
+    key.has_pos_mtx_idx = walk.has_pos_mtx_idx ? 1u : 0u;
+    key.has_tex_mtx_idx = walk.has_tex_mtx_idx ? 1u : 0u;
+    key.tex_mtx_idx_mask = walk.tex_mtx_idx_mask;
+    key.has_color0 = walk.has_color[0] ? 1u : 0u;
+    key.has_color1 = walk.has_color[1] ? 1u : 0u;
+    key.uv_mask =
+        static_cast<std::uint8_t>(walk.uv_mask & ((1u << kMaxTexGens) - 1u));
+    // Vertex-format N/B/T presence (GC packs all three in one NBT attribute, so
+    // binormal/tangent presence follows has_nbt). A lit/emboss draw that omits
+    // one substitutes the cached fallback from the uniform instead of a
+    // per-vertex input (Dolphin I_CACHED_NORMAL, populated below from the last
+    // decoded vertex of a draw that DID carry the attribute).
+    key.has_vertex_normal = walk.has_normal ? 1u : 0u;
+    key.has_vertex_binormal = walk.has_nbt ? 1u : 0u;
+    key.has_vertex_tangent = walk.has_nbt ? 1u : 0u;
 
-  for (std::uint32_t i = 0; i < num_tex_gens; ++i) {
-    const std::uint32_t reg = (0x1040u - 0x1018u) + i;
-    TexGenKey& tg = key.tex_gens[i];
-    tg.enabled = 1;
-    if (draw.xf_reg_mask & (1ull << reg)) {
-      const std::uint32_t info = draw.xf_regs[reg];
-      // XFMemory.h TexMtxInfo bitfields.
-      tg.projection = static_cast<std::uint8_t>(bits(info, 1, 1));
-      tg.inputform = static_cast<std::uint8_t>(bits(info, 1, 2));
-      tg.texgentype = static_cast<std::uint8_t>(bits(info, 3, 4));
-      tg.sourcerow = static_cast<std::uint8_t>(bits(info, 5, 7));
-      tg.embosssourceshift = static_cast<std::uint8_t>(bits(info, 3, 12));
-      tg.embosslightshift = static_cast<std::uint8_t>(bits(info, 3, 15));
+    // Lighting key (S15). LitChannel bitfields (XFMemory.h): matsource@0,
+    // enablelighting@1, lightMask0_3@2, ambsource@6, diffusefunc@7, attnfunc@9,
+    // lightMask4_7@11. chan_regs slot = xf_addr - 0x1009: [0]=numColorChans,
+    // [1..4]=amb0/amb1/mat0/mat1, [5..8]=color0/color1/alpha0/alpha1 ctrl.
+    auto lit_chan = [&](std::uint32_t slot, LightChanKey &ch) {
+      if ((draw.chan_reg_mask & (1u << slot)) == 0u)
+        return;
+      const std::uint32_t v = draw.chan_regs[slot];
+      ch.matsource = static_cast<std::uint8_t>(bits(v, 1, 0));
+      ch.enablelighting = static_cast<std::uint8_t>(bits(v, 1, 1));
+      ch.ambsource = static_cast<std::uint8_t>(bits(v, 1, 6));
+      ch.diffusefunc = static_cast<std::uint8_t>(bits(v, 2, 7));
+      ch.attnfunc = static_cast<std::uint8_t>(bits(v, 2, 9));
+      const std::uint32_t mask = bits(v, 4, 2) | (bits(v, 4, 11) << 4);
+      ch.light_mask = ch.enablelighting ? static_cast<std::uint8_t>(mask) : 0u;
+    };
+    lit_chan(5u, key.litchan[0]);
+    lit_chan(6u, key.litchan[1]);
+    lit_chan(7u, key.litchan[2]);
+    lit_chan(8u, key.litchan[3]);
+    // Record which channel-control regs were actually loaded (slots 5..8 map to
+    // litchan 0..3). A captured channel selecting MatSource::Register drives
+    // the material register; an unconfigured channel stays vertex-color
+    // passthrough.
+    for (std::uint32_t j = 0; j < 4u; ++j)
+      if (draw.chan_reg_mask & (1u << (5u + j)))
+        key.chan_captured_mask |= static_cast<std::uint8_t>(1u << j);
+    if (draw.chan_reg_mask & 0x1u) {
+      std::uint32_t n = bits(draw.chan_regs[0], 2, 0);
+      if (n > 2u)
+        n = 2u;
+      key.num_color_chans = static_cast<std::uint8_t>(n);
     } else {
-      tg.sourcerow =
-          static_cast<std::uint8_t>(TexSourceRow::Tex0) +
-          static_cast<std::uint8_t>(i);
+      // numColorChans reg (XF 0x1009) never captured. GX games always program
+      // it; a 0 here is a capture artifact, not "no channels". Assume both
+      // channels present so the WGSL numColorChans gate never spuriously blacks
+      // a draw whose count we simply did not observe.
+      key.num_color_chans = 2u;
     }
-    // Regular / Color0 / Color1 / Emboss are all generated (item 5). Emboss
-    // without per-vertex NBT uses the cross-draw cached tangent/binormal, so it
-    // is an exercised fallback rather than an unsupported path.
-    if (static_cast<TexGenType>(tg.texgentype) == TexGenType::EmbossMap &&
-        !walk.has_nbt)
-      ++counters.texgen_emboss_cached_nbt;
-    {
-      const auto t = static_cast<TexGenType>(tg.texgentype);
-      if (t == TexGenType::Color0 || t == TexGenType::Color1) {
-        const std::uint32_t ch = t == TexGenType::Color0 ? 0u : 1u;
-        if (key.litchan[ch].enablelighting)
-          ++counters.texgen_color_lit;
-        else
-          ++counters.texgen_color_unlit;
-      }
+    key.lit_valid =
+        (key.litchan[0].enablelighting || key.litchan[1].enablelighting ||
+         key.litchan[2].enablelighting || key.litchan[3].enablelighting)
+            ? 1u
+            : 0u;
+    if (key.has_pos_mtx_idx != 0u && key.lit_valid != 0u)
+      ++counters.per_vertex_normal_matrix;
+    for (std::uint32_t c = 0; c < 4u; ++c) {
+      const std::uint8_t mask = key.litchan[c].light_mask;
+      for (std::uint32_t l = 0; l < 8u; ++l)
+        if ((mask & (1u << l)) && draw.light_word_mask[l] == 0u) {
+          ++counters.lit_light_missing;
+          c = 4u;
+          break;
+        }
     }
+    // Only count normals/lighting as ignored when we fall back to passthrough.
+    if (walk.has_normal && key.lit_valid == 0u)
+      ++counters.normals_ignored;
+    if (key.lit_valid == 0u && (draw.chan_reg_mask & (1u << 5)) &&
+        (draw.chan_regs[5] & 0x2u) != 0u)
+      ++counters.lighting_ignored;
 
-    // The current vertex layout emits position and Tex0..Tex3 source rows for
-    // regular matrix texgens. Classify every other legal source instead of
-    // silently leaving its coordinate at the shader default.
-    if (static_cast<TexGenType>(tg.texgentype) == TexGenType::Regular) {
-      const auto source = static_cast<TexSourceRow>(tg.sourcerow);
-      bool unsupported_source = true;
-      if (source == TexSourceRow::Geom ||
-          (tg.sourcerow >= static_cast<std::uint8_t>(TexSourceRow::Tex0) &&
-           tg.sourcerow <
-               static_cast<std::uint8_t>(TexSourceRow::Tex0) + kMaxTexGens)) {
-        unsupported_source = false;
-      } else if (source == TexSourceRow::Normal) {
-        ++counters.texgen_source_normal;
-        if (!walk.has_normal)
-          ++counters.texgen_source_normal_default;
-        unsupported_source = false;
-      } else if (source == TexSourceRow::Colors) {
-        ++counters.texgen_source_colors;
-      } else if (source == TexSourceRow::BinormalT ||
-                 source == TexSourceRow::BinormalB) {
-        ++counters.texgen_source_binormal;
-      } else if (tg.sourcerow <
-                 static_cast<std::uint8_t>(TexSourceRow::Tex0) + 8u) {
-        ++counters.texgen_source_tex47;
+    for (std::uint32_t i = 0; i < num_tex_gens; ++i) {
+      const std::uint32_t reg = (0x1040u - 0x1018u) + i;
+      TexGenKey &tg = key.tex_gens[i];
+      tg.enabled = 1;
+      if (draw.xf_reg_mask & (1ull << reg)) {
+        const std::uint32_t info = draw.xf_regs[reg];
+        // XFMemory.h TexMtxInfo bitfields.
+        tg.projection = static_cast<std::uint8_t>(bits(info, 1, 1));
+        tg.inputform = static_cast<std::uint8_t>(bits(info, 1, 2));
+        tg.texgentype = static_cast<std::uint8_t>(bits(info, 3, 4));
+        tg.sourcerow = static_cast<std::uint8_t>(bits(info, 5, 7));
+        tg.embosssourceshift = static_cast<std::uint8_t>(bits(info, 3, 12));
+        tg.embosslightshift = static_cast<std::uint8_t>(bits(info, 3, 15));
       } else {
-        ++counters.texgen_source_unknown;
+        tg.sourcerow = static_cast<std::uint8_t>(TexSourceRow::Tex0) +
+                       static_cast<std::uint8_t>(i);
       }
-      if (unsupported_source)
-        ++counters.unsupported_texgen;
-    }
-  }
-  std::uint32_t num_ind_stages = bits(gen_mode, 3, 16);
-  if (num_ind_stages > kMaxIndirectStages) {
-    ++counters.indirect_ignored;
-    num_ind_stages = kMaxIndirectStages;
-  }
-  key.num_ind_stages = static_cast<std::uint8_t>(num_ind_stages);
-  if (num_ind_stages != 0u)
-    ++counters.indirect_active;
-  const std::uint32_t indref = bp_valid_[0x27] ? bp_regs_[0x27] : 0u;
-  for (std::uint32_t i = 0; i < num_ind_stages; ++i) {
-    IndirectStageKey& ind = key.ind_stages[i];
-    ind.texmap = static_cast<std::uint8_t>(bits(indref, 3, 6u * i));
-    ind.texcoord = static_cast<std::uint8_t>(bits(indref, 3, 6u * i + 3u));
-    const std::uint32_t scale =
-        bp_valid_[0x25u + i / 2u] ? bp_regs_[0x25u + i / 2u] : 0u;
-    const std::uint32_t shift = (i & 1u) != 0u ? 8u : 0u;
-    ind.scale_s = static_cast<std::uint8_t>(bits(scale, 4, shift));
-    ind.scale_t = static_cast<std::uint8_t>(bits(scale, 4, shift + 4u));
-  }
-  const std::uint32_t tex_format = draw.texture.format;
-  if (draw.texture.valid &&
-      (tex_format == 0x8u || tex_format == 0x9u || tex_format == 0xAu))
-    ++counters.tlut_texture;
-  key.textured = (draw.texture.valid && draw.texture.resolved &&
-                  num_tex_gens > 0u && draw.texture.width > 0u &&
-                  draw.texture.height > 0u)
-                      ? 1u
-                      : 0u;
-
-  // TEV combiner (S14). Combiner reg 0xC0 present => port the integer TEV;
-  // otherwise leave tev_valid 0 and the passthrough fragment renders (used by
-  // synthetic slices that never write combiner state).
-  if (bp_valid_[0xC0]) {
-    key.tev_valid = 1;
-    std::uint32_t stages = bits(gen_mode, 4, 10) + 1u; // numtevstages + 1
-    if (stages > kMaxTevStages) {
-      counters.tev_stages_over += stages - kMaxTevStages;
-      stages = kMaxTevStages;
-    }
-    key.num_tev_stages = static_cast<std::uint8_t>(stages);
-    auto swap_table = [&](std::uint32_t id, std::uint8_t out[4]) {
-      const std::uint32_t rg = bp_regs_[0xF6u + 2u * id];
-      const std::uint32_t ba = bp_regs_[0xF6u + 2u * id + 1u];
-      out[0] = static_cast<std::uint8_t>(bits(rg, 2, 0)); // swap_rb -> red
-      out[1] = static_cast<std::uint8_t>(bits(rg, 2, 2)); // swap_ga -> green
-      out[2] = static_cast<std::uint8_t>(bits(ba, 2, 0)); // blue
-      out[3] = static_cast<std::uint8_t>(bits(ba, 2, 2)); // alpha
-    };
-    for (std::uint32_t n = 0; n < stages; ++n) {
-      TevStageKey& ts = key.tev_stages[n];
-      const std::uint32_t cc = bp_regs_[0xC0u + 2u * n]; // ColorCombiner
-      const std::uint32_t ac = bp_regs_[0xC1u + 2u * n]; // AlphaCombiner
-      ts.cc_d = static_cast<std::uint8_t>(bits(cc, 4, 0));
-      ts.cc_c = static_cast<std::uint8_t>(bits(cc, 4, 4));
-      ts.cc_b = static_cast<std::uint8_t>(bits(cc, 4, 8));
-      ts.cc_a = static_cast<std::uint8_t>(bits(cc, 4, 12));
-      ts.cc_bias = static_cast<std::uint8_t>(bits(cc, 2, 16));
-      ts.cc_op = static_cast<std::uint8_t>(bits(cc, 1, 18));
-      ts.cc_clamp = static_cast<std::uint8_t>(bits(cc, 1, 19));
-      ts.cc_scale = static_cast<std::uint8_t>(bits(cc, 2, 20));
-      ts.cc_dest = static_cast<std::uint8_t>(bits(cc, 2, 22));
-      ts.ac_a = static_cast<std::uint8_t>(bits(ac, 3, 13));
-      ts.ac_b = static_cast<std::uint8_t>(bits(ac, 3, 10));
-      ts.ac_c = static_cast<std::uint8_t>(bits(ac, 3, 7));
-      ts.ac_d = static_cast<std::uint8_t>(bits(ac, 3, 4));
-      ts.ac_bias = static_cast<std::uint8_t>(bits(ac, 2, 16));
-      ts.ac_op = static_cast<std::uint8_t>(bits(ac, 1, 18));
-      ts.ac_clamp = static_cast<std::uint8_t>(bits(ac, 1, 19));
-      ts.ac_scale = static_cast<std::uint8_t>(bits(ac, 2, 20));
-      ts.ac_dest = static_cast<std::uint8_t>(bits(ac, 2, 22));
-      // TwoTevStageOrders (BP 0x28 + n/2), even/odd halves.
-      const std::uint32_t ord = bp_regs_[0x28u + n / 2u];
-      const bool odd = (n & 1u) != 0u;
-      ts.tevorders_texmap =
-          static_cast<std::uint8_t>(odd ? bits(ord, 3, 12) : bits(ord, 3, 0));
-      ts.tevorders_texcoord =
-          static_cast<std::uint8_t>(odd ? bits(ord, 3, 15) : bits(ord, 3, 3));
-      ts.tevorders_enable =
-          static_cast<std::uint8_t>(odd ? bits(ord, 1, 18) : bits(ord, 1, 6));
-      ts.tevorders_colorchan =
-          static_cast<std::uint8_t>(odd ? bits(ord, 3, 19) : bits(ord, 3, 7));
-      const std::uint32_t indirect =
-          bp_valid_[0x10u + n] ? bp_regs_[0x10u + n] : 0u;
-      ts.ind_stage = static_cast<std::uint8_t>(bits(indirect, 2, 0));
-      ts.ind_format = static_cast<std::uint8_t>(bits(indirect, 2, 2));
-      ts.ind_bias = static_cast<std::uint8_t>(bits(indirect, 3, 4));
-      ts.ind_bump_alpha = static_cast<std::uint8_t>(bits(indirect, 2, 7));
-      ts.ind_matrix_index = static_cast<std::uint8_t>(bits(indirect, 2, 9));
-      ts.ind_matrix_id = static_cast<std::uint8_t>(bits(indirect, 2, 11));
-      ts.ind_wrap_s = static_cast<std::uint8_t>(bits(indirect, 3, 13));
-      ts.ind_wrap_t = static_cast<std::uint8_t>(bits(indirect, 3, 16));
-      ts.ind_use_original_lod =
-          static_cast<std::uint8_t>(bits(indirect, 1, 19));
-      ts.ind_add_prev = static_cast<std::uint8_t>(bits(indirect, 1, 20));
-      const bool samples_indirect =
-          ts.ind_matrix_index != 0u || ts.ind_bump_alpha != 0u;
-      if (samples_indirect && ts.ind_stage >= num_ind_stages)
-        ++counters.indirect_ignored;
-      if (ts.ind_matrix_id == 3u || ts.ind_use_original_lod != 0u)
-        ++counters.indirect_ignored;
-      if (ts.tevorders_enable != 0u && ts.tevorders_texmap != 0u)
-        ++counters.tev_multi_texmap;
-      // Konst selectors (AllTevKSels ksel[n/2]).
-      const std::uint32_t ksel = bp_regs_[0xF6u + n / 2u];
-      ts.ksel_kc =
-          static_cast<std::uint8_t>(odd ? bits(ksel, 5, 14) : bits(ksel, 5, 4));
-      ts.ksel_ka =
-          static_cast<std::uint8_t>(odd ? bits(ksel, 5, 19) : bits(ksel, 5, 9));
-      swap_table(bits(ac, 2, 0), ts.ras_swap); // rswap
-      swap_table(bits(ac, 2, 2), ts.tex_swap); // tswap
-    }
-    if (bp_valid_[0xF3]) { // AlphaTest (BP 0xF3)
-      const std::uint32_t at = bp_regs_[0xF3];
-      key.alpha_comp0 = static_cast<std::uint8_t>(bits(at, 3, 16));
-      key.alpha_comp1 = static_cast<std::uint8_t>(bits(at, 3, 19));
-      key.alpha_logic = static_cast<std::uint8_t>(bits(at, 2, 22));
-    }
-  }
-
-  if (key.tev_valid != 0u && key.textured != 0u &&
-      key.num_tex_gens != 0u) {
-    ++counters.texcoord_scale_active;
-    bool scale_mismatch = false;
-    auto compare_scale = [&](std::uint32_t coord, std::uint32_t texmap) {
-      if (coord >= key.num_tex_gens)
-        coord = 0u;
-      texmap &= 7u;
-      const ar::ConsumedTexture* texture = &draw.textures[texmap];
-      if (!texture->valid || !texture->resolved || texture->width == 0u ||
-          texture->height == 0u) {
-        if (!draw.texture.valid || !draw.texture.resolved ||
-            (draw.texture.slot & 7u) != texmap)
-          return;
-        texture = &draw.texture;
+      // Regular / Color0 / Color1 / Emboss are all generated (item 5). Emboss
+      // without per-vertex NBT uses the cross-draw cached tangent/binormal, so
+      // it is an exercised fallback rather than an unsupported path.
+      if (static_cast<TexGenType>(tg.texgentype) == TexGenType::EmbossMap &&
+          !walk.has_nbt)
+        ++counters.texgen_emboss_cached_nbt;
+      {
+        const auto t = static_cast<TexGenType>(tg.texgentype);
+        if (t == TexGenType::Color0 || t == TexGenType::Color1) {
+          const std::uint32_t ch = t == TexGenType::Color0 ? 0u : 1u;
+          if (key.litchan[ch].enablelighting)
+            ++counters.texgen_color_lit;
+          else
+            ++counters.texgen_color_unlit;
+        }
       }
-      const std::uint32_t sreg = 0x30u + 2u * coord;
-      const std::uint32_t treg = sreg + 1u;
-      const std::uint32_t scale_s =
-          (bp_valid_[sreg] ? bits(bp_regs_[sreg], 16, 0) : 0u) + 1u;
-      const std::uint32_t scale_t =
-          (bp_valid_[treg] ? bits(bp_regs_[treg], 16, 0) : 0u) + 1u;
-      scale_mismatch |=
-          scale_s != texture->width || scale_t != texture->height;
-    };
-    for (std::uint32_t n = 0; n < key.num_tev_stages; ++n) {
-      const TevStageKey& ts = key.tev_stages[n];
-      if (ts.tevorders_enable != 0u)
-        compare_scale(ts.tevorders_texcoord, ts.tevorders_texmap);
-      if (ts.ind_stage < key.num_ind_stages &&
-          (ts.ind_matrix_index != 0u || ts.ind_bump_alpha != 0u)) {
-        const IndirectStageKey& ind = key.ind_stages[ts.ind_stage];
-        compare_scale(ind.texcoord, ind.texmap);
+
+      // The current vertex layout emits position and Tex0..Tex3 source rows for
+      // regular matrix texgens. Classify every other legal source instead of
+      // silently leaving its coordinate at the shader default.
+      if (static_cast<TexGenType>(tg.texgentype) == TexGenType::Regular) {
+        const auto source = static_cast<TexSourceRow>(tg.sourcerow);
+        bool unsupported_source = true;
+        if (source == TexSourceRow::Geom ||
+            (tg.sourcerow >= static_cast<std::uint8_t>(TexSourceRow::Tex0) &&
+             tg.sourcerow <
+                 static_cast<std::uint8_t>(TexSourceRow::Tex0) + kMaxTexGens)) {
+          unsupported_source = false;
+        } else if (source == TexSourceRow::Normal) {
+          ++counters.texgen_source_normal;
+          if (!walk.has_normal)
+            ++counters.texgen_source_normal_default;
+          unsupported_source = false;
+        } else if (source == TexSourceRow::Colors) {
+          ++counters.texgen_source_colors;
+        } else if (source == TexSourceRow::BinormalT ||
+                   source == TexSourceRow::BinormalB) {
+          ++counters.texgen_source_binormal;
+        } else if (tg.sourcerow <
+                   static_cast<std::uint8_t>(TexSourceRow::Tex0) + 8u) {
+          ++counters.texgen_source_tex47;
+        } else {
+          ++counters.texgen_source_unknown;
+        }
+        if (unsupported_source)
+          ++counters.unsupported_texgen;
       }
     }
-    if (scale_mismatch)
-      ++counters.texcoord_scale_mismatch;
-  }
-
-  PipelineKey& pipe = plan.pipeline;
-  pipe.cull_mode = static_cast<std::uint8_t>(cull);
-  const std::uint32_t zmode = bp_valid_[0x40] ? bp_regs_[0x40] : 0x17u;
-  pipe.depth_test = static_cast<std::uint8_t>(bits(zmode, 1, 0));
-  pipe.depth_func = static_cast<std::uint8_t>(bits(zmode, 3, 1));
-  pipe.depth_update = static_cast<std::uint8_t>(bits(zmode, 1, 4));
-  const std::uint32_t cmode0 = bp_valid_[0x41] ? bp_regs_[0x41] : 0u;
-  pipe.blend_enable = static_cast<std::uint8_t>(bits(cmode0, 1, 0));
-  pipe.blend_subtract = static_cast<std::uint8_t>(bits(cmode0, 1, 11));
-  pipe.dst_factor = static_cast<std::uint8_t>(bits(cmode0, 3, 5));
-  pipe.src_factor = static_cast<std::uint8_t>(bits(cmode0, 3, 8));
-  pipe.color_update = static_cast<std::uint8_t>(bits(cmode0, 1, 3));
-  const std::uint32_t dst_alpha = bp_valid_[0x42] ? bp_regs_[0x42] : 0u;
-  const std::uint32_t pe_control = bp_valid_[0x43] ? bp_regs_[0x43] : 0u;
-  const bool target_has_alpha = bits(pe_control, 3, 0) == 1u;
-  pipe.alpha_update = static_cast<std::uint8_t>(
-      bits(cmode0, 1, 4) != 0u && target_has_alpha);
-
-  // Dolphin BlendingState keeps RGB and alpha factors separate. EFB formats
-  // without alpha read destination alpha as one, and color factors collapse to
-  // their alpha equivalents when operating on the alpha channel.
-  if (!target_has_alpha) {
-    if (pipe.src_factor == 6u)
-      pipe.src_factor = 1u;
-    else if (pipe.src_factor == 7u)
-      pipe.src_factor = 0u;
-    if (pipe.dst_factor == 6u)
-      pipe.dst_factor = 1u;
-    else if (pipe.dst_factor == 7u)
-      pipe.dst_factor = 0u;
-  }
-  pipe.src_factor_alpha = pipe.src_factor;
-  pipe.dst_factor_alpha = pipe.dst_factor;
-  if (pipe.src_factor_alpha == 2u)
-    pipe.src_factor_alpha = 6u;
-  else if (pipe.src_factor_alpha == 3u)
-    pipe.src_factor_alpha = 7u;
-  if (pipe.dst_factor_alpha == 2u)
-    pipe.dst_factor_alpha = 4u;
-  else if (pipe.dst_factor_alpha == 3u)
-    pipe.dst_factor_alpha = 5u;
-
-  pipe.early_depth_test = static_cast<std::uint8_t>(bits(pe_control, 1, 6));
-  if (pipe.depth_test != 0u && pipe.early_depth_test != 0u)
-    ++counters.early_depth_active;
-
-  // BP F4/F5 ZTexture. Dolphin writes the sampled depth only for late Z tests;
-  // Wind Waker's JFWDisplay clear quad is REPLACE/U24 with depth writes on.
-  // Keep early-Z/fog-only and malformed forms explicit gaps rather than
-  // silently emitting the wrong fragment-depth contract.
-  const std::uint32_t ztex2 = bp_valid_[0xF5] ? bp_regs_[0xF5] : 0u;
-  const std::uint32_t ztex_type = bits(ztex2, 2, 0);
-  const std::uint32_t ztex_op = bits(ztex2, 2, 2);
-  if (ztex_op != 0u) {
-    const bool supported = ztex_op <= 2u && ztex_type <= 2u &&
-                           key.tev_valid != 0u && key.textured != 0u &&
-                           pipe.depth_test != 0u && pipe.depth_update != 0u &&
-                           pipe.early_depth_test == 0u;
-    if (supported) {
-      key.ztex_op = static_cast<std::uint8_t>(ztex_op);
-      key.ztex_type = static_cast<std::uint8_t>(ztex_type);
-      ++counters.ztexture_active;
-    } else {
-      ++counters.ztexture_ignored;
+    std::uint32_t num_ind_stages = bits(gen_mode, 3, 16);
+    if (num_ind_stages > kMaxIndirectStages) {
+      ++counters.indirect_ignored;
+      num_ind_stages = kMaxIndirectStages;
     }
+    key.num_ind_stages = static_cast<std::uint8_t>(num_ind_stages);
+    if (num_ind_stages != 0u)
+      ++counters.indirect_active;
+    const std::uint32_t indref = bp_valid_[0x27] ? bp_regs_[0x27] : 0u;
+    for (std::uint32_t i = 0; i < num_ind_stages; ++i) {
+      IndirectStageKey &ind = key.ind_stages[i];
+      ind.texmap = static_cast<std::uint8_t>(bits(indref, 3, 6u * i));
+      ind.texcoord = static_cast<std::uint8_t>(bits(indref, 3, 6u * i + 3u));
+      const std::uint32_t scale =
+          bp_valid_[0x25u + i / 2u] ? bp_regs_[0x25u + i / 2u] : 0u;
+      const std::uint32_t shift = (i & 1u) != 0u ? 8u : 0u;
+      ind.scale_s = static_cast<std::uint8_t>(bits(scale, 4, shift));
+      ind.scale_t = static_cast<std::uint8_t>(bits(scale, 4, shift + 4u));
+    }
+    const std::uint32_t tex_format = draw.texture.format;
+    if (draw.texture.valid &&
+        (tex_format == 0x8u || tex_format == 0x9u || tex_format == 0xAu))
+      ++counters.tlut_texture;
+    key.textured =
+        (draw.texture.valid && draw.texture.resolved && num_tex_gens > 0u &&
+         draw.texture.width > 0u && draw.texture.height > 0u)
+            ? 1u
+            : 0u;
+
+    // TEV combiner (S14). Combiner reg 0xC0 present => port the integer TEV;
+    // otherwise leave tev_valid 0 and the passthrough fragment renders (used by
+    // synthetic slices that never write combiner state).
+    if (bp_valid_[0xC0]) {
+      key.tev_valid = 1;
+      std::uint32_t stages = bits(gen_mode, 4, 10) + 1u; // numtevstages + 1
+      if (stages > kMaxTevStages) {
+        counters.tev_stages_over += stages - kMaxTevStages;
+        stages = kMaxTevStages;
+      }
+      key.num_tev_stages = static_cast<std::uint8_t>(stages);
+      auto swap_table = [&](std::uint32_t id, std::uint8_t out[4]) {
+        const std::uint32_t rg = bp_regs_[0xF6u + 2u * id];
+        const std::uint32_t ba = bp_regs_[0xF6u + 2u * id + 1u];
+        out[0] = static_cast<std::uint8_t>(bits(rg, 2, 0)); // swap_rb -> red
+        out[1] = static_cast<std::uint8_t>(bits(rg, 2, 2)); // swap_ga -> green
+        out[2] = static_cast<std::uint8_t>(bits(ba, 2, 0)); // blue
+        out[3] = static_cast<std::uint8_t>(bits(ba, 2, 2)); // alpha
+      };
+      for (std::uint32_t n = 0; n < stages; ++n) {
+        TevStageKey &ts = key.tev_stages[n];
+        const std::uint32_t cc = bp_regs_[0xC0u + 2u * n]; // ColorCombiner
+        const std::uint32_t ac = bp_regs_[0xC1u + 2u * n]; // AlphaCombiner
+        ts.cc_d = static_cast<std::uint8_t>(bits(cc, 4, 0));
+        ts.cc_c = static_cast<std::uint8_t>(bits(cc, 4, 4));
+        ts.cc_b = static_cast<std::uint8_t>(bits(cc, 4, 8));
+        ts.cc_a = static_cast<std::uint8_t>(bits(cc, 4, 12));
+        ts.cc_bias = static_cast<std::uint8_t>(bits(cc, 2, 16));
+        ts.cc_op = static_cast<std::uint8_t>(bits(cc, 1, 18));
+        ts.cc_clamp = static_cast<std::uint8_t>(bits(cc, 1, 19));
+        ts.cc_scale = static_cast<std::uint8_t>(bits(cc, 2, 20));
+        ts.cc_dest = static_cast<std::uint8_t>(bits(cc, 2, 22));
+        ts.ac_a = static_cast<std::uint8_t>(bits(ac, 3, 13));
+        ts.ac_b = static_cast<std::uint8_t>(bits(ac, 3, 10));
+        ts.ac_c = static_cast<std::uint8_t>(bits(ac, 3, 7));
+        ts.ac_d = static_cast<std::uint8_t>(bits(ac, 3, 4));
+        ts.ac_bias = static_cast<std::uint8_t>(bits(ac, 2, 16));
+        ts.ac_op = static_cast<std::uint8_t>(bits(ac, 1, 18));
+        ts.ac_clamp = static_cast<std::uint8_t>(bits(ac, 1, 19));
+        ts.ac_scale = static_cast<std::uint8_t>(bits(ac, 2, 20));
+        ts.ac_dest = static_cast<std::uint8_t>(bits(ac, 2, 22));
+        // TwoTevStageOrders (BP 0x28 + n/2), even/odd halves.
+        const std::uint32_t ord = bp_regs_[0x28u + n / 2u];
+        const bool odd = (n & 1u) != 0u;
+        ts.tevorders_texmap =
+            static_cast<std::uint8_t>(odd ? bits(ord, 3, 12) : bits(ord, 3, 0));
+        ts.tevorders_texcoord =
+            static_cast<std::uint8_t>(odd ? bits(ord, 3, 15) : bits(ord, 3, 3));
+        ts.tevorders_enable =
+            static_cast<std::uint8_t>(odd ? bits(ord, 1, 18) : bits(ord, 1, 6));
+        ts.tevorders_colorchan =
+            static_cast<std::uint8_t>(odd ? bits(ord, 3, 19) : bits(ord, 3, 7));
+        const std::uint32_t indirect =
+            bp_valid_[0x10u + n] ? bp_regs_[0x10u + n] : 0u;
+        ts.ind_stage = static_cast<std::uint8_t>(bits(indirect, 2, 0));
+        ts.ind_format = static_cast<std::uint8_t>(bits(indirect, 2, 2));
+        ts.ind_bias = static_cast<std::uint8_t>(bits(indirect, 3, 4));
+        ts.ind_bump_alpha = static_cast<std::uint8_t>(bits(indirect, 2, 7));
+        ts.ind_matrix_index = static_cast<std::uint8_t>(bits(indirect, 2, 9));
+        ts.ind_matrix_id = static_cast<std::uint8_t>(bits(indirect, 2, 11));
+        ts.ind_wrap_s = static_cast<std::uint8_t>(bits(indirect, 3, 13));
+        ts.ind_wrap_t = static_cast<std::uint8_t>(bits(indirect, 3, 16));
+        ts.ind_use_original_lod =
+            static_cast<std::uint8_t>(bits(indirect, 1, 19));
+        ts.ind_add_prev = static_cast<std::uint8_t>(bits(indirect, 1, 20));
+        const bool samples_indirect =
+            ts.ind_matrix_index != 0u || ts.ind_bump_alpha != 0u;
+        if (samples_indirect && ts.ind_stage >= num_ind_stages)
+          ++counters.indirect_ignored;
+        if (ts.ind_matrix_id == 3u || ts.ind_use_original_lod != 0u)
+          ++counters.indirect_ignored;
+        if (ts.tevorders_enable != 0u && ts.tevorders_texmap != 0u)
+          ++counters.tev_multi_texmap;
+        // Konst selectors (AllTevKSels ksel[n/2]).
+        const std::uint32_t ksel = bp_regs_[0xF6u + n / 2u];
+        ts.ksel_kc = static_cast<std::uint8_t>(odd ? bits(ksel, 5, 14)
+                                                   : bits(ksel, 5, 4));
+        ts.ksel_ka = static_cast<std::uint8_t>(odd ? bits(ksel, 5, 19)
+                                                   : bits(ksel, 5, 9));
+        swap_table(bits(ac, 2, 0), ts.ras_swap); // rswap
+        swap_table(bits(ac, 2, 2), ts.tex_swap); // tswap
+      }
+      if (bp_valid_[0xF3]) { // AlphaTest (BP 0xF3)
+        const std::uint32_t at = bp_regs_[0xF3];
+        key.alpha_comp0 = static_cast<std::uint8_t>(bits(at, 3, 16));
+        key.alpha_comp1 = static_cast<std::uint8_t>(bits(at, 3, 19));
+        key.alpha_logic = static_cast<std::uint8_t>(bits(at, 2, 22));
+      }
+    }
+
+    if (key.tev_valid != 0u && key.textured != 0u && key.num_tex_gens != 0u) {
+      ++counters.texcoord_scale_active;
+      bool scale_mismatch = false;
+      auto compare_scale = [&](std::uint32_t coord, std::uint32_t texmap) {
+        if (coord >= key.num_tex_gens)
+          coord = 0u;
+        texmap &= 7u;
+        const ar::ConsumedTexture *texture = &draw.textures[texmap];
+        if (!texture->valid || !texture->resolved || texture->width == 0u ||
+            texture->height == 0u) {
+          if (!draw.texture.valid || !draw.texture.resolved ||
+              (draw.texture.slot & 7u) != texmap)
+            return;
+          texture = &draw.texture;
+        }
+        const std::uint32_t sreg = 0x30u + 2u * coord;
+        const std::uint32_t treg = sreg + 1u;
+        const std::uint32_t scale_s =
+            (bp_valid_[sreg] ? bits(bp_regs_[sreg], 16, 0) : 0u) + 1u;
+        const std::uint32_t scale_t =
+            (bp_valid_[treg] ? bits(bp_regs_[treg], 16, 0) : 0u) + 1u;
+        scale_mismatch |=
+            scale_s != texture->width || scale_t != texture->height;
+      };
+      for (std::uint32_t n = 0; n < key.num_tev_stages; ++n) {
+        const TevStageKey &ts = key.tev_stages[n];
+        if (ts.tevorders_enable != 0u)
+          compare_scale(ts.tevorders_texcoord, ts.tevorders_texmap);
+        if (ts.ind_stage < key.num_ind_stages &&
+            (ts.ind_matrix_index != 0u || ts.ind_bump_alpha != 0u)) {
+          const IndirectStageKey &ind = key.ind_stages[ts.ind_stage];
+          compare_scale(ind.texcoord, ind.texmap);
+        }
+      }
+      if (scale_mismatch)
+        ++counters.texcoord_scale_mismatch;
+    }
+
+    pipe.cull_mode = static_cast<std::uint8_t>(cull);
+    const std::uint32_t zmode = bp_valid_[0x40] ? bp_regs_[0x40] : 0x17u;
+    pipe.depth_test = static_cast<std::uint8_t>(bits(zmode, 1, 0));
+    pipe.depth_func = static_cast<std::uint8_t>(bits(zmode, 3, 1));
+    pipe.depth_update = static_cast<std::uint8_t>(bits(zmode, 1, 4));
+    const std::uint32_t cmode0 = bp_valid_[0x41] ? bp_regs_[0x41] : 0u;
+    pipe.blend_enable = static_cast<std::uint8_t>(bits(cmode0, 1, 0));
+    pipe.blend_subtract = static_cast<std::uint8_t>(bits(cmode0, 1, 11));
+    pipe.dst_factor = static_cast<std::uint8_t>(bits(cmode0, 3, 5));
+    pipe.src_factor = static_cast<std::uint8_t>(bits(cmode0, 3, 8));
+    pipe.color_update = static_cast<std::uint8_t>(bits(cmode0, 1, 3));
+    const std::uint32_t dst_alpha = bp_valid_[0x42] ? bp_regs_[0x42] : 0u;
+    const std::uint32_t pe_control = bp_valid_[0x43] ? bp_regs_[0x43] : 0u;
+    const bool target_has_alpha = bits(pe_control, 3, 0) == 1u;
+    pipe.alpha_update =
+        static_cast<std::uint8_t>(bits(cmode0, 1, 4) != 0u && target_has_alpha);
+
+    // Dolphin BlendingState keeps RGB and alpha factors separate. EFB formats
+    // without alpha read destination alpha as one, and color factors collapse
+    // to their alpha equivalents when operating on the alpha channel.
+    if (!target_has_alpha) {
+      if (pipe.src_factor == 6u)
+        pipe.src_factor = 1u;
+      else if (pipe.src_factor == 7u)
+        pipe.src_factor = 0u;
+      if (pipe.dst_factor == 6u)
+        pipe.dst_factor = 1u;
+      else if (pipe.dst_factor == 7u)
+        pipe.dst_factor = 0u;
+    }
+    pipe.src_factor_alpha = pipe.src_factor;
+    pipe.dst_factor_alpha = pipe.dst_factor;
+    if (pipe.src_factor_alpha == 2u)
+      pipe.src_factor_alpha = 6u;
+    else if (pipe.src_factor_alpha == 3u)
+      pipe.src_factor_alpha = 7u;
+    if (pipe.dst_factor_alpha == 2u)
+      pipe.dst_factor_alpha = 4u;
+    else if (pipe.dst_factor_alpha == 3u)
+      pipe.dst_factor_alpha = 5u;
+
+    pipe.early_depth_test = static_cast<std::uint8_t>(bits(pe_control, 1, 6));
+    if (pipe.depth_test != 0u && pipe.early_depth_test != 0u)
+      ++counters.early_depth_active;
+
+    // BP F4/F5 ZTexture. Dolphin writes the sampled depth only for late Z
+    // tests; Wind Waker's JFWDisplay clear quad is REPLACE/U24 with depth
+    // writes on. Keep early-Z/fog-only and malformed forms explicit gaps rather
+    // than silently emitting the wrong fragment-depth contract.
+    const std::uint32_t ztex2 = bp_valid_[0xF5] ? bp_regs_[0xF5] : 0u;
+    const std::uint32_t ztex_type = bits(ztex2, 2, 0);
+    const std::uint32_t ztex_op = bits(ztex2, 2, 2);
+    if (ztex_op != 0u) {
+      const bool supported = ztex_op <= 2u && ztex_type <= 2u &&
+                             key.tev_valid != 0u && key.textured != 0u &&
+                             pipe.depth_test != 0u && pipe.depth_update != 0u &&
+                             pipe.early_depth_test == 0u;
+      if (supported) {
+        key.ztex_op = static_cast<std::uint8_t>(ztex_op);
+        key.ztex_type = static_cast<std::uint8_t>(ztex_type);
+        ++counters.ztexture_active;
+      } else {
+        ++counters.ztexture_ignored;
+      }
+    }
+    const bool use_dst_alpha = bits(dst_alpha, 1, 8) != 0u &&
+                               pipe.alpha_update != 0u && target_has_alpha;
+    if (use_dst_alpha) {
+      pipe.src_factor_alpha = 1u;
+      pipe.dst_factor_alpha = 0u;
+    }
+    key.use_dst_alpha = use_dst_alpha ? 1u : 0u;
+    key.dst_alpha = static_cast<std::uint8_t>(bits(dst_alpha, 8, 0));
+    if (use_dst_alpha)
+      ++counters.dst_alpha_active;
+    if (bits(cmode0, 1, 1) != 0u)
+      ++counters.logic_op_ignored;
+
+    derived.input = input;
+    derived.pipeline = plan.pipeline;
+    derived.valid = true;
+    for (auto member : counter_members)
+      derived.delta.*member = counters.*member - before.*member;
+    ++derived.misses;
   }
-  const bool use_dst_alpha = bits(dst_alpha, 1, 8) != 0u &&
-                             pipe.alpha_update != 0u &&
-                             target_has_alpha;
-  if (use_dst_alpha) {
-    pipe.src_factor_alpha = 1u;
-    pipe.dst_factor_alpha = 0u;
-  }
-  key.use_dst_alpha = use_dst_alpha ? 1u : 0u;
-  key.dst_alpha = static_cast<std::uint8_t>(bits(dst_alpha, 8, 0));
-  if (use_dst_alpha)
-    ++counters.dst_alpha_active;
-  if (bits(cmode0, 1, 1) != 0u)
-    ++counters.logic_op_ignored;
 
   // Topology.
   const auto primitive =
@@ -1100,15 +1195,36 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     return skip("unsupported or empty primitive");
   }
 
+  std::uint32_t packed_size = 0, packed_stride = 4;
+  for (std::uint32_t e = 0; e < walk.entry_count; ++e)
+    packed_size += std::max(1u, walk.entries[e].element_size);
+  while (packed_stride < packed_size)
+    packed_stride *= 2;
+  // Larger records offer no bandwidth saving. The original decoder remains
+  // the fallback, including formats with NBT or many texture coordinates.
+  packed_vertices = packed_vertices && packed_stride < kVertexStrideBytes;
+  if (packed_vertices) {
+    key.packed_stride = static_cast<std::uint8_t>(packed_stride);
+    std::uint32_t format[5] = {vcd_lo_, vcd_hi_, vat_[draw.vtx_fmt][0],
+                               vat_[draw.vtx_fmt][1], vat_[draw.vtx_fmt][2]};
+    std::memcpy(key.packed_format, format, sizeof(format));
+    plan.packed_vertices.assign(std::size_t(draw.vertex_count) * packed_stride,
+                                0);
+  }
   // Vertex decode to the fixed layout.
   plan.vertex_count = draw.vertex_count;
   plan.vertices.assign(
-      static_cast<std::size_t>(draw.vertex_count) * kVertexFloats, 0.f);
+      static_cast<std::size_t>(packed_vertices ? 1 : draw.vertex_count) *
+          kVertexFloats,
+      0.f);
   const std::uint8_t* payload = draw.vertex_payload.data();
   const std::size_t payload_size = draw.vertex_payload.size();
   for (std::uint32_t v = 0; v < draw.vertex_count; ++v) {
-    float* out_vertex = plan.vertices.data() +
-                        static_cast<std::size_t>(v) * kVertexFloats;
+    float *out_vertex =
+        plan.vertices.data() +
+        static_cast<std::size_t>(packed_vertices ? 0 : v) * kVertexFloats;
+    std::uint32_t packed_offset = 0;
+    const bool decode_vertex = !packed_vertices || v + 1 == draw.vertex_count;
     // Defaults: color0/1 white, uv 0, posmtx = current matrix's first row.
     out_vertex[4] = out_vertex[5] = out_vertex[6] = out_vertex[7] = 1.f;
     out_vertex[8] = out_vertex[9] = out_vertex[10] = out_vertex[11] = 1.f;
@@ -1122,7 +1238,12 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
         static_cast<std::size_t>(v) * walk.vertex_size;
     for (std::uint32_t e = 0; e < walk.entry_count; ++e) {
       const WalkEntry& entry = walk.entries[e];
-      if (offset >= payload_size) {
+      const std::uint32_t payload_advance = entry.element_size == 0 ? 1u
+                                            : entry.vcd_type == 1u
+                                                ? entry.element_size
+                                            : entry.vcd_type == 2u ? 1u
+                                                                   : 2u;
+      if (offset + payload_advance > payload_size) {
         ++counters.vertex_decode_failures;
         ++counters.vertex_payload_overrun;
         return skip("payload overrun");
@@ -1132,10 +1253,14 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
       std::uint32_t advance = 0;
       if (entry.kind == WalkEntry::kPosMtxIdx) {
         posmtx_row = p[0];
+        if (packed_vertices)
+          plan.packed_vertices[v * packed_stride + packed_offset++] = p[0];
         offset += 1;
         continue;
       }
       if (entry.kind == WalkEntry::kTexMtxIdx) {
+        if (packed_vertices)
+          plan.packed_vertices[v * packed_stride + packed_offset++] = p[0];
         // GX per-vertex TEXMTXIDX: the byte is a matrix-memory row index (GX
         // pre-multiplies by 3, same convention as PNMTXIDX). Pack one byte per
         // texgen so the VS can select transformmatrices[row] per vertex.
@@ -1175,6 +1300,14 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
             element_offset;
       }
       offset += advance;
+      if (packed_vertices) {
+        std::memcpy(plan.packed_vertices.data() + v * packed_stride +
+                        packed_offset,
+                    element, entry.element_size);
+        packed_offset += entry.element_size;
+      }
+      if (!decode_vertex)
+        continue;
 
       switch (entry.kind) {
       case WalkEntry::kPos: {
@@ -1633,9 +1766,10 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
       c.cached_binormal[k] = cached->binormal[k];
     }
     if (plan.vertex_count > 0u) {
-      const float* last =
-          plan.vertices.data() +
-          static_cast<std::size_t>(plan.vertex_count - 1u) * kVertexFloats;
+      const float *last = plan.vertices.data() +
+                          static_cast<std::size_t>(
+                              packed_vertices ? 0 : plan.vertex_count - 1u) *
+                              kVertexFloats;
       if (walk.has_normal)
         for (std::uint32_t k = 0; k < 3u; ++k)
           cached->normal[k] = last[kVertexNormalOffset / 4u + k];
@@ -1649,6 +1783,12 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
   }
 
   plan.ok = true;
+  if (packed_vertices) {
+    ++counters.packed_vertex_draws;
+    counters.packed_vertex_bytes_saved +=
+        std::uint64_t(plan.vertex_count) * kVertexStrideBytes -
+        plan.packed_vertices.size();
+  }
   ++counters.draws_planned;
   return;
 }
@@ -1666,8 +1806,9 @@ void GxCoreSink::on_consumed_draw(const ar::ConsumedDraw& draw,
   if (self->plan_observer_ == nullptr)
     return;
   DrawPlan& plan = self->scratch_plan_;
-  self->pending_state_.build_draw_plan_into(draw, self->counters_,
-                                            &self->cached_attrs_, plan);
+  self->pending_state_.build_draw_plan_into(
+      draw, self->counters_, &self->cached_attrs_, plan,
+      self->packed_vertex_policy_ && self->packed_vertex_policy_());
   self->plan_observer_(plan, self->plan_observer_user_);
 }
 

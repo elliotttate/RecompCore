@@ -967,6 +967,19 @@ void push_draw_command(rmlui::DrawData data) {
 
 #ifdef AURORA_ENABLE_GXCORE
 template <>
+gxcore::DrawData* get_last_draw_command() {
+  if (g_currentRenderPass >= current_render_passes().size())
+    return nullptr;
+  auto& commands = current_render_passes()[g_currentRenderPass].commands;
+  if (commands.empty())
+    return nullptr;
+  auto& last = commands.back();
+  if (last.type != CommandType::Draw || last.data.draw.type != ShaderType::GXCore)
+    return nullptr;
+  return &last.data.draw.gxcore;
+}
+
+template <>
 void push_draw_command(gxcore::DrawData data) {
   push_draw_command(
       ShaderDrawCommand{.type = ShaderType::GXCore, .gxcore = data});
@@ -2002,7 +2015,10 @@ void after_submit() noexcept {
 
 void gpu_synchronize() { render_worker::synchronize(); }
 
+static std::atomic<unsigned long long> g_shownFrames{0};
+
 void after_present() noexcept {
+  g_shownFrames.fetch_add(1, std::memory_order_relaxed);
   const auto now = PresentClock::now();
   const int64_t nowNs = timestamp_ns(now);
   const int64_t previousPresentNs = g_lastPresentNs.exchange(nowNs, std::memory_order_acq_rel);
@@ -2172,6 +2188,18 @@ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
   return push(current_frame_packet().indices, data, length, alignment);
 }
 
+void rebase_indices_u16(Range range, uint16_t base) {
+  auto& bytes = current_frame_packet().indices;
+  CHECK(range.offset + range.size <= bytes.size() && range.size % 2 == 0, "Invalid index rebase range");
+  for (uint32_t offset = range.offset; offset < range.offset + range.size; offset += 2) {
+    uint16_t value;
+    std::memcpy(&value, bytes.data() + offset, 2);
+    CHECK(uint32_t(value) + base <= 65535u, "Merged index overflow");
+    value += base;
+    std::memcpy(bytes.data() + offset, &value, 2);
+  }
+}
+
 size_t recording_frame_slot() { return g_recordingFrameSlot; }
 
 Range push_interp_uniform(size_t slot, const uint8_t* data, size_t length) {
@@ -2315,3 +2343,7 @@ bool aurora_peek_z(uint16_t x, uint16_t y, uint32_t* z) {
   return true;
 }
 float aurora_get_fps() { return aurora::gfx::calculate_fps(); }
+
+unsigned long long aurora_get_shown_frames(void) {
+  return aurora::gfx::g_shownFrames.load(std::memory_order_relaxed);
+}

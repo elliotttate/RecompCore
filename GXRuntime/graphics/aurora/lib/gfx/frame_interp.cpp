@@ -1189,4 +1189,13 @@ uint64_t game_frame_number() noexcept { return g_gameFrame.load(std::memory_orde
 } // namespace aurora::gfx::frame_interp
 
 void aurora_set_frame_interpolation(bool enabled) { aurora::gfx::frame_interp::set_enabled(enabled); }
+// Read from another thread for diagnostics; each value is one aligned word.
+void aurora_get_frame_interp_totals(AuroraFrameInterpTotals* out) {
+  using namespace aurora::gfx::frame_interp;
+  out->frames = g_framesSeen;
+  out->interpolated = g_framesInterpolated;
+  out->draws = g_totalCounts.draws;
+  out->rejected = g_totalCounts.rejected;
+  out->unmatched = g_totalCounts.unmatched;
+}
 bool aurora_get_frame_interpolation() { return aurora::gfx::frame_interp::enabled(); }

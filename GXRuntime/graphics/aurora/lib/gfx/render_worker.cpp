@@ -51,7 +51,23 @@ void worker_main() {
 
     if (item->work) {
       ZoneScopedN("QueueItem work");
+      // An item that holds the worker long holds the translation worker too
+      // (its queue fills) and so the game: say which (DOL_RENDER_SLOW_MS, 60).
+      static const long slowMs = [] {
+        const char* env = std::getenv("DOL_RENDER_SLOW_MS");
+        return env != nullptr ? std::strtol(env, nullptr, 10) : 60L;
+      }();
+      const auto start = std::chrono::steady_clock::now();
       item->work();
+      const long ms = static_cast<long>(
+          std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count());
+      if (slowMs > 0 && ms >= slowMs) {
+        static const char* const kTypes[] = {"begin-frame", "encode-pass", "end-frame", "sync", "shutdown"};
+        const auto type = static_cast<size_t>(item->type);
+        std::fprintf(stderr, "[render-slow] ms=%ld item=%s frame=%llu pass=%u\n", ms,
+                     type < 5 ? kTypes[type] : "?", static_cast<unsigned long long>(item->frameId),
+                     item->passIndex);
+      }
     }
     complete_sync(item->sync);
     g_pendingItems.fetch_sub(1, std::memory_order_acq_rel);

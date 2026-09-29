@@ -38,6 +38,10 @@ void dol_aurora_set_event_observer(DolAuroraEventObserverFn observe, void* user)
 // it pumps events and sleeps on the main thread until the predicate clears.
 typedef bool (*DolAuroraHoldFn)(void* user);
 void dol_aurora_set_hold(DolAuroraHoldFn should_hold, void* user);
+// While the guest is held at a present, keep drawing frames: the last picture
+// with the host overlay over it, so an overlay menu drawn with ImGui stays live
+// (a menu that pauses the game). Off by default: the hold then only waits.
+void dol_aurora_set_hold_redraw(bool redraw);
 // Fast-forward, for stretches with nothing to see or hear (a scene change's
 // black): frames are rendered but not presented, and audio pushes are
 // dropped, so neither the display nor the audio queue holds the guest to real
@@ -59,6 +63,12 @@ typedef struct DolAuroraFrameTiming {
     unsigned long long audio_throttles; /* 1 ms waits for the audio queue to drain */
     unsigned long long audio_dropped;   /* pushes dropped on a full queue (no throttle) */
     int audio_queued_ms;                /* audio waiting in the device queue now */
+    unsigned long long shown;           /* frames presented, in-between frames included */
+    unsigned long long interp_frames;   /* game frames the in-between frames saw */
+    unsigned long long interp_interpolated; /* ... and interpolated */
+    unsigned long long interp_draws;
+    unsigned long long interp_rejected; /* draws judged implausible (not blended) */
+    unsigned long long interp_unmatched; /* draws with no counterpart the frame before */
 } DolAuroraFrameTiming;
 void dol_aurora_frame_timing(DolAuroraFrameTiming* out);
 
