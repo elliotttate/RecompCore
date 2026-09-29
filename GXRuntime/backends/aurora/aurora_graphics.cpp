@@ -833,6 +833,39 @@ static u8 g_shadow_frontend_last_write_size;
 
 static void shadow_frontend_flush(void);
 
+// shadow_frontend_write for a word the running translation worker takes (the
+// front end live, a 1, 2, 4 or 8-byte write): the same bookkeeping, and the
+// word's bytes appended to the worker's batch in guest order directly.
+static inline void shadow_frontend_enqueue_word(u64 value, u8 size) {
+    g_shadow_frontend_last_write_value = value;
+    g_shadow_frontend_last_write_size = size;
+    g_shadow_frontend_pending_bytes += size;
+    std::uint8_t* const out = g_fifo_local + g_fifo_local_size;
+    switch (size) {
+    case 1:
+        out[0] = static_cast<std::uint8_t>(value);
+        break;
+    case 2: {
+        const std::uint16_t word = __builtin_bswap16(static_cast<std::uint16_t>(value));
+        std::memcpy(out, &word, 2);
+        break;
+    }
+    case 4: {
+        const std::uint32_t word = __builtin_bswap32(static_cast<std::uint32_t>(value));
+        std::memcpy(out, &word, 4);
+        break;
+    }
+    default: {
+        const std::uint64_t word = __builtin_bswap64(value);
+        std::memcpy(out, &word, 8);
+        break;
+    }
+    }
+    g_fifo_local_size += size;
+    if (g_fifo_local_size >= fifo_local_batch_limit())
+        g_fifo_publish_local();
+}
+
 void shadow_frontend_write(u64 value, u8 size) {
     if (!g_shadow_frontend_enabled || g_shadow_frontend_failed)
         return;
@@ -1616,6 +1649,22 @@ void aurora_backend_gx_flush(void) {
 }
 
 void aurora_backend_gx_write(u64 value, u8 size) {
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    // Every gather-pipe word in play: the recorder open, the translation
+    // worker running, nothing traced and no present waiting on this write.
+    // The path below does just this for such a word - counts it and hands its
+    // bytes to the worker's batch - through three calls and a byte-by-byte
+    // copy, about 3 percent of the game thread at native 60 Hz.
+    if (gx_aurora::g_initialized && gx_aurora::g_gx_core_enabled && gx_aurora::g_frame_open &&
+        !gx_aurora::g_trace_armed && gx_aurora::g_fifo_worker_started &&
+        gx_aurora::g_shadow_frontend_enabled && !gx_aurora::g_shadow_frontend_failed &&
+        (size == 1u || size == 2u || size == 4u || size == 8u) &&
+        !gx_aurora::g_display_copy_pending.load(std::memory_order_relaxed)) {
+        gx_aurora::g_fifo_bytes += size;
+        gx_aurora::shadow_frontend_enqueue_word(value, size);
+        return;
+    }
+#endif
     if (!gx_aurora::g_initialized)
         return;
     gx_aurora::g_fifo_bytes += size;
