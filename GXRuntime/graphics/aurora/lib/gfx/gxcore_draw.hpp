@@ -13,6 +13,21 @@
 
 namespace aurora::gfx::gxcore {
 
+// Retail GXSetViewport writes a 342-pixel XF origin bias. Aurora's native
+// GX API has a paired 340 encoder/decoder convention; do not use that
+// convention for FIFO written by the original game. A two-pixel error here
+// shifts geometry once, then shifts an EFB-copy postprocess over it again.
+inline Viewport retail_viewport(const float (&raw)[6]) {
+  return {
+      .left = raw[3] - 342.f - raw[0],
+      .top = raw[4] - 342.f + raw[1],
+      .width = raw[0] * 2.f,
+      .height = -raw[1] * 2.f,
+      .znear = (raw[5] - raw[2]) / 16777215.f,
+      .zfar = raw[5] / 16777215.f,
+  };
+}
+
 struct DrawData {
   PipelineRef pipeline;
   PipelineRef depthPipeline; // early-Z depth-only pass, 0 when unnecessary
