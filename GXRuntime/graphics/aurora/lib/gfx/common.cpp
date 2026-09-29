@@ -961,6 +961,19 @@ void push_draw_command(rmlui::DrawData data) {
 
 #ifdef AURORA_ENABLE_GXCORE
 template <>
+gxcore::DrawData* get_last_draw_command() {
+  if (g_currentRenderPass >= current_render_passes().size())
+    return nullptr;
+  auto& commands = current_render_passes()[g_currentRenderPass].commands;
+  if (commands.empty())
+    return nullptr;
+  auto& last = commands.back();
+  if (last.type != CommandType::Draw || last.data.draw.type != ShaderType::GXCore)
+    return nullptr;
+  return &last.data.draw.gxcore;
+}
+
+template <>
 void push_draw_command(gxcore::DrawData data) {
   push_draw_command(
       ShaderDrawCommand{.type = ShaderType::GXCore, .gxcore = data});
@@ -2107,6 +2120,18 @@ Range push_verts(const uint8_t* data, size_t length, size_t alignment) {
 Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
   ZoneScoped;
   return push(current_frame_packet().indices, data, length, alignment);
+}
+
+void rebase_indices_u16(Range range, uint16_t base) {
+  auto& bytes = current_frame_packet().indices;
+  CHECK(range.offset + range.size <= bytes.size() && range.size % 2 == 0, "Invalid index rebase range");
+  for (uint32_t offset = range.offset; offset < range.offset + range.size; offset += 2) {
+    uint16_t value;
+    std::memcpy(&value, bytes.data() + offset, 2);
+    CHECK(uint32_t(value) + base <= 65535u, "Merged index overflow");
+    value += base;
+    std::memcpy(bytes.data() + offset, &value, 2);
+  }
 }
 
 Range push_interp_uniform(const uint8_t* data, size_t length) {

@@ -197,6 +197,10 @@ struct LightChanKey {
 static_assert(std::has_unique_object_representations_v<LightChanKey>);
 
 struct ShaderKey {
+  // Byte-packed raw attribute record; zero keeps the fixed CPU-decoded ABI.
+  std::uint8_t packed_format[20]{}; // VCD lo/hi and three VAT words
+  std::uint8_t packed_stride = 0;
+  std::uint8_t packed_padding[3]{};
   std::uint8_t num_tex_gens = 0;    // XF numTexGens (0x103F), capped kMaxTexGens
   std::uint8_t has_pos_mtx_idx = 0; // per-vertex PNMTXIDX attr present
   std::uint8_t has_tex_mtx_idx = 0; // per-vertex TEXMTXIDX attr present (item 5)
@@ -461,6 +465,8 @@ struct DrawPlan {
   PipelineKey pipeline{};
   VertexShaderConstants constants{};
   PixelShaderConstants pixel_constants{}; // S14 TEV color/konst/alpha uniforms
+  std::vector<std::uint8_t>
+      packed_vertices;         // compact immutable raw attribute snapshots
   std::vector<float> vertices; // kVertexFloats per vertex
   std::vector<std::uint16_t> indices;
   std::uint32_t vertex_count = 0;

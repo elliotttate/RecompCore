@@ -24,9 +24,22 @@ struct DrawData {
   Range interpUniformRange;
   Range pixelUniformRange;  // PixelShaderConstants (group 2), TEV path only
   uint32_t indexCount;
+  uint32_t vertexStride = gxruntime::gxcore::kVertexStrideBytes;
+  bool packedVertices = false;
   BindGroupRef textureBindGroup; // 0 when untextured
   bool tev = false; // TEV path: PS uniform at group 2, texture at group 3
 };
+
+inline bool can_merge_draws(const DrawData& a, const DrawData& b) {
+  const uint32_t stride = a.vertexStride;
+  return stride != 0 && a.vertexStride == b.vertexStride && a.packedVertices == b.packedVertices &&
+         a.depthPipeline == 0 && b.depthPipeline == 0 && a.pipeline == b.pipeline &&
+         a.textureBindGroup == b.textureBindGroup && a.tev == b.tev && a.uniformRange == b.uniformRange &&
+         a.interpUniformRange == b.interpUniformRange && a.pixelUniformRange == b.pixelUniformRange &&
+         a.vertRange.offset + a.vertRange.size == b.vertRange.offset &&
+         a.idxRange.offset + a.idxRange.size == b.idxRange.offset && a.vertRange.size % stride == 0 &&
+         b.vertRange.size % stride == 0 && (uint64_t(a.vertRange.size) + b.vertRange.size) / stride <= 65535u;
+}
 
 // Bump when generate_wgsl output or the DrawData/vertex layout changes: the
 // persisted pipeline cache precompiles stored configs at startup, and a
@@ -42,7 +55,8 @@ struct DrawData {
 // v9: GXSetZCompLoc early depth adds a depth-only pipeline variant. v10:
 // RGB and alpha blending carry donor-exact independent factors. v11: BP SU
 // texture-coordinate scales enlarge pixel constants and alter TEV WGSL.
-constexpr uint32_t GXCorePipelineConfigVersion = 12;
+// v12: shared texture layouts. v13: optional packed-vertex storage fetch.
+constexpr uint32_t GXCorePipelineConfigVersion = 13;
 
 struct PipelineConfig {
   uint32_t version = GXCorePipelineConfigVersion;

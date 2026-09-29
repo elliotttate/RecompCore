@@ -6,6 +6,7 @@
 #include <aurora/texture.hpp>
 #include <gxruntime/guest_memory_dirty.h>
 #if GXRUNTIME_HAS_AURORA_RECOMP
+#include <gfx/frame_interp.hpp>
 #include <gfx/gxcore_draw.hpp>
 #endif
 #include <SDL3/SDL_init.h>
@@ -402,6 +403,13 @@ bool dol_aurora_initialize(int argc, char** argv,
         dol_guest_memory_dirty_reset();
         aurora::gfx::gxcore::set_texture_dirty_epoch_observer(
             gx_aurora::core_texture_dirty_epoch);
+        gx_aurora::g_core_sink.set_packed_vertex_policy([] {
+          static const bool enabled = [] {
+            const char *value = std::getenv("DOL_GXCORE_GPU_VERTICES");
+            return value && std::strcmp(value, "1") == 0;
+          }();
+          return enabled && !aurora::gfx::frame_interp::enabled();
+        });
         gx_aurora::g_core_sink.set_plan_observer(gx_aurora::core_plan_observer, nullptr);
         gx_aurora::g_core_sink.set_copy_observer(gx_aurora::core_copy_observer, nullptr);
         gx_aurora::g_core_submitted = 0;
@@ -533,6 +541,8 @@ void dol_aurora_shutdown(void) {
     gx_aurora::trace_close_and_log();
     if (gx_aurora::g_gx_core_enabled) {
         const auto& gaps = gx_aurora::g_core_sink.counters();
+        std::fprintf(stderr, "[gx-packed] draws=%llu vertex_bytes_saved=%llu\n",
+                     gaps.packed_vertex_draws, gaps.packed_vertex_bytes_saved);
         std::fprintf(stderr,
                      "[gx-core] shutdown: submitted=%llu rejected=%llu "
                      "failed=%d planned=%llu skipped=%llu noops=%llu cull_all=%llu "

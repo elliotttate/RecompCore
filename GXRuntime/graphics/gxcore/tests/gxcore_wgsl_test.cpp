@@ -5,6 +5,7 @@
 // hand-built state, assert bytes.
 
 #include "gxruntime/gxcore/gxcore.hpp"
+#include "gxruntime/gxcore/vertex_layout.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -42,6 +43,78 @@ void append_be_f32(std::vector<std::uint8_t>& out, float value) {
 
 ar::RenderStatePacket bp(std::uint32_t reg, std::uint32_t value) {
   return {.kind = ar::RenderStateKind::BpReg, .index = reg, .value = value};
+}
+
+// Exercise every existing valid fixture through packed collection as well.
+// Rebuild a direct-attribute draw from its packed bytes, then use the original
+// CPU decoder as the oracle. This checks index gathering, padding, all scalar
+// and color formats, NBT ordering, cache continuity, and mutable array reads.
+gxc::DrawPlan checked_plan(const gxc::GxCoreState &state,
+                           const ar::ConsumedDraw &draw,
+                           gxc::GapCounters &counters,
+                           gxc::CachedVertexAttrs *cached = nullptr) {
+  gxc::CachedVertexAttrs before = cached ? *cached : gxc::CachedVertexAttrs{};
+  auto plan = state.build_draw_plan(draw, counters, cached);
+  gxc::GapCounters gaps;
+  auto packed_cache = before;
+  auto packed =
+      state.build_draw_plan(draw, gaps, cached ? &packed_cache : nullptr, true);
+  CHECK(plan.ok == packed.ok);
+  if (!plan.ok || packed.packed_vertices.empty())
+    return plan;
+  CHECK(plan.indices == packed.indices);
+  CHECK(std::memcmp(&plan.constants, &packed.constants,
+                    sizeof(plan.constants)) == 0);
+  CHECK(std::memcmp(&plan.pixel_constants, &packed.pixel_constants,
+                    sizeof(plan.pixel_constants)) == 0);
+  CHECK(std::memcmp(plan.vertices.data() +
+                        (plan.vertex_count - 1) * gxc::kVertexFloats,
+                    packed.vertices.data(), gxc::kVertexStrideBytes) == 0);
+  if (cached)
+    CHECK(std::memcmp(cached, &packed_cache, sizeof(packed_cache)) == 0);
+  std::uint32_t words[5];
+  std::memcpy(words, packed.pipeline.shader.packed_format, sizeof(words));
+  gxc::WalkLayout walk;
+  CHECK(gxc::derive_vertex_layout(words[0], words[1], words + 2, walk));
+  std::uint32_t size = 0;
+  for (unsigned e = 0; e < walk.entry_count; ++e)
+    size += std::max(1u, walk.entries[e].element_size);
+  ar::ConsumedDraw direct = draw;
+  direct.array_input_count = 0;
+  direct.vertex_size = size;
+  direct.vertex_payload.resize(std::size_t(size) * direct.vertex_count);
+  for (unsigned v = 0; v < direct.vertex_count; ++v)
+    std::memcpy(direct.vertex_payload.data() + v * size,
+                packed.packed_vertices.data() +
+                    v * packed.pipeline.shader.packed_stride,
+                size);
+  for (unsigned shift = 9; shift <= 15; shift += 2)
+    if ((words[0] >> shift) & 3u)
+      words[0] = (words[0] & ~(3u << shift)) | (1u << shift);
+  for (unsigned shift = 0; shift < 16; shift += 2)
+    if ((words[1] >> shift) & 3u)
+      words[1] = (words[1] & ~(3u << shift)) | (1u << shift);
+  words[2] &= ~(1u << 31); // index3 becomes one direct NBT record
+  auto direct_state = state;
+  direct_state.apply(
+      {.kind = ar::RenderStateKind::CpVcd, .index = 0, .value = words[0]});
+  direct_state.apply(
+      {.kind = ar::RenderStateKind::CpVcd, .index = 1, .value = words[1]});
+  for (unsigned i = 0; i < 3; ++i)
+    direct_state.apply({.kind = ar::RenderStateKind::CpVat,
+                        .index = draw.vtx_fmt,
+                        .value = words[i + 2],
+                        .aux0 = i});
+  auto unpacked = direct_state.build_draw_plan(direct, gaps, &before);
+  CHECK(unpacked.ok);
+  CHECK(unpacked.vertices.size() == plan.vertices.size());
+  if (unpacked.vertices.size() == plan.vertices.size())
+    CHECK(std::memcmp(unpacked.vertices.data(), plan.vertices.data(),
+                      plan.vertices.size() * sizeof(float)) == 0);
+  auto wgsl = gxc::generate_wgsl(packed.pipeline.shader);
+  CHECK(wgsl.find("@builtin(vertex_index)") != std::string::npos);
+  CHECK(wgsl.find("var<storage,read> packed_vertices") != std::string::npos);
+  return plan;
 }
 
 // The golden WGSL for the textured 1-texgen key below. Regenerate by running
@@ -195,7 +268,7 @@ void test_state_to_plan_and_wgsl() {
   draw.viewport[5] = 16777215.f;
 
   gxc::GapCounters counters;
-  const gxc::DrawPlan plan = state.build_draw_plan(draw, counters);
+  const gxc::DrawPlan plan = checked_plan(state, draw, counters);
   if (!plan.ok)
     std::fprintf(stderr, "plan skipped: %s\n", plan.skip_reason);
   CHECK(plan.ok);
@@ -209,8 +282,7 @@ void test_state_to_plan_and_wgsl() {
     gxc::GxCoreState sampler_state = state;
     sampler_state.apply(bp(0x80u, (2u << 2u) | (4u << 5u)));
     gxc::GapCounters gaps;
-    const gxc::DrawPlan sampler_plan =
-        sampler_state.build_draw_plan(draw, gaps);
+    const gxc::DrawPlan sampler_plan = checked_plan(sampler_state, draw, gaps);
     CHECK(sampler_plan.ok);
     CHECK(sampler_plan.samplers[0].wrap_s == 0u);
     CHECK(sampler_plan.samplers[0].wrap_t == 2u);
@@ -224,8 +296,7 @@ void test_state_to_plan_and_wgsl() {
     gxc::GxCoreState sampler_state = state;
     sampler_state.apply(bp(0x80u, 6u << 5u));
     gxc::GapCounters gaps;
-    const gxc::DrawPlan sampler_plan =
-        sampler_state.build_draw_plan(draw, gaps);
+    const gxc::DrawPlan sampler_plan = checked_plan(sampler_state, draw, gaps);
     CHECK(sampler_plan.samplers[0].min_filter == 1u);
     CHECK(sampler_plan.samplers[0].mipmap_filter == 2u);
   }
@@ -236,11 +307,11 @@ void test_state_to_plan_and_wgsl() {
     gxc::GxCoreState sampler_state = state;
     sampler_state.apply(bp(0x80u, 5u << 5u));
     gxc::GapCounters gaps;
-    const gxc::DrawPlan lin_mip_near = sampler_state.build_draw_plan(draw, gaps);
+    const gxc::DrawPlan lin_mip_near = checked_plan(sampler_state, draw, gaps);
     CHECK(lin_mip_near.samplers[0].min_filter == 1u);
     CHECK(lin_mip_near.samplers[0].mipmap_filter == 1u);
     sampler_state.apply(bp(0x80u, 2u << 5u));
-    const gxc::DrawPlan near_mip_lin = sampler_state.build_draw_plan(draw, gaps);
+    const gxc::DrawPlan near_mip_lin = checked_plan(sampler_state, draw, gaps);
     CHECK(near_mip_lin.samplers[0].min_filter == 0u);
     CHECK(near_mip_lin.samplers[0].mipmap_filter == 2u);
   }
@@ -253,7 +324,7 @@ void test_state_to_plan_and_wgsl() {
     scale_state.apply(bp(0x30u, 15u)); // S scale 16
     scale_state.apply(bp(0x31u, 7u));  // T scale 8
     gxc::GapCounters gaps;
-    const gxc::DrawPlan scale_plan = scale_state.build_draw_plan(draw, gaps);
+    const gxc::DrawPlan scale_plan = checked_plan(scale_state, draw, gaps);
     CHECK(scale_plan.ok);
     CHECK(scale_plan.pixel_constants.texdims[0][2] == 16);
     CHECK(scale_plan.pixel_constants.texdims[0][3] == 8);
@@ -268,7 +339,7 @@ void test_state_to_plan_and_wgsl() {
     dst_state.apply(bp(0x42u, 0x100u | 0x5Au));
     dst_state.apply(bp(0x43u, 1u));
     gxc::GapCounters gaps;
-    const gxc::DrawPlan dst_plan = dst_state.build_draw_plan(draw, gaps);
+    const gxc::DrawPlan dst_plan = checked_plan(dst_state, draw, gaps);
     CHECK(dst_plan.ok);
     CHECK(dst_plan.pipeline.shader.use_dst_alpha == 1u);
     CHECK(dst_plan.pipeline.shader.dst_alpha == 0x5Au);
@@ -290,8 +361,7 @@ void test_state_to_plan_and_wgsl() {
     gxc::GxCoreState early_z_state = state;
     early_z_state.apply(bp(0x43u, 1u << 6u));
     gxc::GapCounters gaps;
-    const gxc::DrawPlan early_z_plan =
-        early_z_state.build_draw_plan(draw, gaps);
+    const gxc::DrawPlan early_z_plan = checked_plan(early_z_state, draw, gaps);
     CHECK(early_z_plan.ok);
     CHECK(early_z_plan.pipeline.early_depth_test == 1u);
     CHECK(gaps.early_depth_active == 1u);
@@ -305,8 +375,7 @@ void test_state_to_plan_and_wgsl() {
     scissor_state.apply(bp(0x21u, (661u << 12u) | 821u));
     scissor_state.apply(bp(0x59u, 171u | (171u << 10u)));
     gxc::GapCounters gaps;
-    const gxc::DrawPlan scissor_plan =
-        scissor_state.build_draw_plan(draw, gaps);
+    const gxc::DrawPlan scissor_plan = checked_plan(scissor_state, draw, gaps);
     CHECK(scissor_plan.ok);
     CHECK(scissor_plan.scissor_valid);
     CHECK(scissor_plan.scissor_x == 0);
@@ -320,7 +389,7 @@ void test_state_to_plan_and_wgsl() {
   auto classify_texgen = [&](std::uint32_t info, gxc::GapCounters& gaps) {
     ar::ConsumedDraw classified = draw;
     classified.xf_regs[0x28] = info;
-    return state.build_draw_plan(classified, gaps);
+    return checked_plan(state, classified, gaps);
   };
   {
     gxc::GapCounters gaps;
@@ -364,7 +433,7 @@ void test_state_to_plan_and_wgsl() {
     gxc::GapCounters gaps;
     ar::ConsumedDraw overflow = draw;
     overflow.xf_regs[0x27] = 5u;
-    CHECK(state.build_draw_plan(overflow, gaps).ok);
+    CHECK(checked_plan(state, overflow, gaps).ok);
     CHECK(gaps.unsupported_texgen == 0u);
     CHECK(gaps.texgen_count_overflow == 0u);
     CHECK(gaps.texgen_count_5 == 1u);
@@ -375,14 +444,14 @@ void test_state_to_plan_and_wgsl() {
   {
     ar::ConsumedDraw line = draw;
     line.primitive = 0xA8;
-    const gxc::DrawPlan line_plan = state.build_draw_plan(line, counters);
+    const gxc::DrawPlan line_plan = checked_plan(state, line, counters);
     CHECK(line_plan.ok);
     CHECK(line_plan.pipeline.primitive_topology == 1u);
     CHECK(line_plan.indices.size() == 4u);
 
     ar::ConsumedDraw points = draw;
     points.primitive = 0xB8;
-    const gxc::DrawPlan point_plan = state.build_draw_plan(points, counters);
+    const gxc::DrawPlan point_plan = checked_plan(state, points, counters);
     CHECK(point_plan.ok);
     CHECK(point_plan.pipeline.primitive_topology == 2u);
     CHECK(point_plan.indices.size() == 4u);
@@ -391,7 +460,7 @@ void test_state_to_plan_and_wgsl() {
     partial_quad.vertex_count = 3u;
     partial_quad.vertex_payload.resize(3u * partial_quad.vertex_size);
     const gxc::DrawPlan partial_plan =
-        state.build_draw_plan(partial_quad, counters);
+        checked_plan(state, partial_quad, counters);
     CHECK(!partial_plan.ok);
     CHECK(counters.draws_noop == 1u);
     CHECK(counters.draws_skipped == 0u);
@@ -436,7 +505,7 @@ void test_state_to_plan_and_wgsl() {
     alpha_blend_state.apply(bp(0x43u, 1u));
     gxc::GapCounters gaps;
     const gxc::DrawPlan alpha_blend_plan =
-        alpha_blend_state.build_draw_plan(draw, gaps);
+        checked_plan(alpha_blend_state, draw, gaps);
     CHECK(alpha_blend_plan.ok);
     CHECK(alpha_blend_plan.pipeline.alpha_update == 1u);
     CHECK(alpha_blend_plan.pipeline.src_factor == 2u);
@@ -452,7 +521,7 @@ void test_state_to_plan_and_wgsl() {
     rgb_state.apply(bp(0x41u, 1u | (7u << 5u) | (6u << 8u) |
                                  (1u << 3u) | (1u << 4u)));
     gxc::GapCounters gaps;
-    const gxc::DrawPlan rgb_plan = rgb_state.build_draw_plan(draw, gaps);
+    const gxc::DrawPlan rgb_plan = checked_plan(rgb_state, draw, gaps);
     CHECK(rgb_plan.ok);
     CHECK(rgb_plan.pipeline.src_factor == 1u);
     CHECK(rgb_plan.pipeline.dst_factor == 0u);
@@ -587,7 +656,7 @@ void test_vertex_texmtxidx_and_nbt() {
   draw.xf_reg_mask = (1ull << 0x27);
 
   gxc::GapCounters counters;
-  const gxc::DrawPlan plan = state.build_draw_plan(draw, counters);
+  const gxc::DrawPlan plan = checked_plan(state, draw, counters);
   if (!plan.ok)
     std::fprintf(stderr, "nbt plan skipped: %s\n", plan.skip_reason);
   CHECK(plan.ok);
@@ -759,7 +828,7 @@ void test_fifth_texgen_plan_decode() {
   draw.tex_matrix_word_mask[1] = 0xFFFu;
 
   gxc::GapCounters gaps;
-  const gxc::DrawPlan plan = state.build_draw_plan(draw, gaps);
+  const gxc::DrawPlan plan = checked_plan(state, draw, gaps);
   CHECK(plan.ok);
   CHECK(plan.pipeline.shader.num_tex_gens == 5u);
   CHECK(plan.pipeline.shader.uv_mask == 0x10u);
@@ -1066,7 +1135,7 @@ void test_tev_modulate() {
   draw.texture.host_available = sizeof tex_bytes;
 
   gxc::GapCounters counters;
-  const gxc::DrawPlan plan = state.build_draw_plan(draw, counters);
+  const gxc::DrawPlan plan = checked_plan(state, draw, counters);
   if (!plan.ok)
     std::fprintf(stderr, "tev plan skipped: %s\n", plan.skip_reason);
   CHECK(plan.ok);
@@ -1110,7 +1179,7 @@ void test_tev_modulate() {
 
     gxc::GapCounters slot_gaps;
     const gxc::DrawPlan slot_plan =
-        slot_state.build_draw_plan(slot_draw, slot_gaps);
+        checked_plan(slot_state, slot_draw, slot_gaps);
     CHECK(slot_plan.ok);
     CHECK(gxc::used_texmap_mask(slot_plan.pipeline.shader) == (1u << 3u));
     CHECK(slot_plan.texmap_mask == 0u);
@@ -1146,7 +1215,7 @@ void test_tev_modulate() {
   state.apply(bp(0xF4, 0x001234u));
   state.apply(bp(0xF5, 2u | (2u << 2u)));
   gxc::GapCounters ztex_counters;
-  const gxc::DrawPlan ztex_plan = state.build_draw_plan(draw, ztex_counters);
+  const gxc::DrawPlan ztex_plan = checked_plan(state, draw, ztex_counters);
   CHECK(ztex_plan.ok);
   CHECK(ztex_plan.pipeline.shader.ztex_op == 2u);
   CHECK(ztex_plan.pipeline.shader.ztex_type == 2u);
@@ -1358,7 +1427,7 @@ void test_lighting() {
   draw.normal_matrix_word_mask[2] = (1u << 9) - 1u;
 
   gxc::GapCounters counters;
-  const gxc::DrawPlan plan = state.build_draw_plan(draw, counters);
+  const gxc::DrawPlan plan = checked_plan(state, draw, counters);
   if (!plan.ok)
     std::fprintf(stderr, "lit plan skipped: %s\n", plan.skip_reason);
   CHECK(plan.ok);
@@ -1640,7 +1709,7 @@ void test_cached_normal() {
 
   gxc::CachedVertexAttrs cache{};
   gxc::GapCounters counters;
-  const gxc::DrawPlan plan_a = state.build_draw_plan(draw_a, counters, &cache);
+  const gxc::DrawPlan plan_a = checked_plan(state, draw_a, counters, &cache);
   CHECK(plan_a.ok);
   CHECK(plan_a.pipeline.shader.has_vertex_normal == 1);
   // Cache advanced to the last vertex's raw object-space normal (0, 1, 0).
@@ -1667,7 +1736,7 @@ void test_cached_normal() {
     }
     draw_b.vertex_payload = payload;
   }
-  const gxc::DrawPlan plan_b = state.build_draw_plan(draw_b, counters, &cache);
+  const gxc::DrawPlan plan_b = checked_plan(state, draw_b, counters, &cache);
   CHECK(plan_b.ok);
   CHECK(plan_b.pipeline.shader.lit_valid == 1);
   CHECK(plan_b.pipeline.shader.has_vertex_normal == 0);
@@ -1803,7 +1872,7 @@ void test_fog() {
   draw.viewport[5] = 16777215.f;
 
   gxc::GapCounters counters;
-  const gxc::DrawPlan plan = state.build_draw_plan(draw, counters);
+  const gxc::DrawPlan plan = checked_plan(state, draw, counters);
   if (!plan.ok)
     std::fprintf(stderr, "fog plan skipped: %s\n", plan.skip_reason);
   CHECK(plan.ok);

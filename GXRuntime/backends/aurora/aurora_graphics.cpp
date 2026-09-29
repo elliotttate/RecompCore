@@ -98,9 +98,13 @@ void core_plan_observer(const gxruntime::gxcore::DrawPlan& plan, void*) {
             std::fprintf(stderr, " %u/%u/%u", k.litchan[j].matsource, k.litchan[j].ambsource, k.litchan[j].enablelighting);
         {
             const unsigned stride = gxruntime::gxcore::kVertexFloats;
-            for (unsigned v = 0; v < plan.vertex_count && v < 4u; ++v) {
-                const float* p = plan.vertices.data() + v * stride;
-                std::fprintf(stderr, "[plan-tex]   v%u pos=%.1f,%.1f,%.1f col0=%.3f,%.3f,%.3f,%.3f\n", v, p[0], p[1], p[2], p[4], p[5], p[6], p[7]);
+            for (unsigned v = 0; v < plan.vertices.size() / stride && v < 4u;
+                 ++v) {
+              const float *p = plan.vertices.data() + v * stride;
+              std::fprintf(stderr,
+                           "[plan-tex]   v%u pos=%.1f,%.1f,%.1f "
+                           "col0=%.3f,%.3f,%.3f,%.3f\n",
+                           v, p[0], p[1], p[2], p[4], p[5], p[6], p[7]);
             }
         }
         const auto& vc = plan.constants;
@@ -1259,13 +1263,55 @@ static void aurora_backend_present_impl(void) {
         }
     }
 #endif
+    static const char *capture_path = std::getenv("DOL_GXCORE_CAPTURE_PATH");
+    static const unsigned long long capture_frame = [] {
+      const char *value = std::getenv("DOL_GXCORE_CAPTURE_FRAME");
+      return value ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    const bool capture =
+        capture_path && capture_frame == gx_aurora::g_present_count + 1;
     if (gx_aurora::g_frame_open) {
-        gx_aurora::run_host_overlay();
-        gx_aurora::g_timing_draws += aurora_get_stats()->drawCallCount;
-        const unsigned long long end_frame_start = gx_aurora::timing_now_us();
-        aurora_end_frame();
-        gx_aurora::g_timing_end_frame_us += gx_aurora::timing_now_us() - end_frame_start;
-        gx_aurora::g_frame_open = false;
+      if (capture)
+        aurora_request_framebuffer_readback();
+      gx_aurora::run_host_overlay();
+      gx_aurora::g_timing_draws += aurora_get_stats()->drawCallCount;
+      const unsigned long long end_frame_start = gx_aurora::timing_now_us();
+      aurora_end_frame();
+      gx_aurora::g_timing_end_frame_us +=
+          gx_aurora::timing_now_us() - end_frame_start;
+      gx_aurora::g_frame_open = false;
+      // Opt-in diagnostic: read the real EFB, including native simulation
+      // frames that never pass through the interpolation capture path.
+      if (capture) {
+        const std::uint8_t *rgba = nullptr;
+        u32 width = 0, height = 0;
+        bool ready = false;
+        for (unsigned attempt = 0; attempt < 20000; ++attempt) {
+          if (aurora_take_framebuffer_readback(&rgba, &width, &height)) {
+            ready = true;
+            break;
+          }
+          aurora_pump_framebuffer_readback();
+          std::this_thread::sleep_for(std::chrono::microseconds(250));
+        }
+        if (ready) {
+          if (FILE *file = std::fopen(capture_path, "wb")) {
+            std::fprintf(file,
+                         "P7\nWIDTH %u\nHEIGHT %u\nDEPTH 4\nMAXVAL "
+                         "255\nTUPLTYPE RGB_ALPHA\nENDHDR\n",
+                         width, height);
+            const auto count =
+                std::fwrite(rgba, 4, std::size_t(width) * height, file);
+            std::fclose(file);
+            std::fprintf(
+                stderr,
+                "[gx-capture] frame=%llu pixels=%zu size=%ux%u path=%s\n",
+                capture_frame, count, width, height, capture_path);
+          }
+        } else
+          std::fprintf(stderr, "[gx-capture] frame=%llu readback timed out\n",
+                       capture_frame);
+      }
     }
     ++gx_aurora::g_present_count;
 #if GXRUNTIME_HAS_AURORA_RECOMP

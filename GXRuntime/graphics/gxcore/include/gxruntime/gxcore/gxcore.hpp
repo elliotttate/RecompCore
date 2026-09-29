@@ -22,6 +22,8 @@ namespace gxruntime::gxcore {
 // demand signal that schedules the S13-S16 module work.
 struct GapCounters {
   unsigned long long draws_planned = 0;
+  unsigned long long packed_vertex_draws = 0;
+  unsigned long long packed_vertex_bytes_saved = 0;
   unsigned long long draws_skipped = 0;         // plan.ok == false
   unsigned long long draws_noop = 0;            // valid incomplete primitive
   unsigned long long cull_all_draws = 0;        // culled by state, not a gap
@@ -114,14 +116,15 @@ public:
   // VertexLoaderManager normal_cache write on m_remaining==0). nullptr in unit
   // tests that don't exercise the fallback (fields stay zero, matching a fresh
   // cache).
-  DrawPlan build_draw_plan(const gxruntime::aurora_recomp::ConsumedDraw& draw,
-                           GapCounters& counters,
-                           CachedVertexAttrs* cached = nullptr) const;
+  DrawPlan build_draw_plan(const gxruntime::aurora_recomp::ConsumedDraw &draw,
+                           GapCounters &counters,
+                           CachedVertexAttrs *cached = nullptr,
+                           bool packed_vertices = false) const;
   // As build_draw_plan, into a caller-owned plan whose vector capacity is kept
   // across draws (no per-draw allocation of the vertex and index arrays).
-  void build_draw_plan_into(const gxruntime::aurora_recomp::ConsumedDraw& draw,
-                            GapCounters& counters, CachedVertexAttrs* cached,
-                            DrawPlan& plan) const;
+  void build_draw_plan_into(const gxruntime::aurora_recomp::ConsumedDraw &draw,
+                            GapCounters &counters, CachedVertexAttrs *cached,
+                            DrawPlan &plan, bool packed_vertices = false) const;
 
   std::uint32_t bp(std::uint8_t reg) const { return bp_regs_[reg]; }
   bool bp_valid(std::uint8_t reg) const { return bp_valid_[reg]; }
@@ -156,6 +159,9 @@ public:
   using CopyObserver = void (*)(const EfbCopyCommand& cmd, void* user);
 
   GxCoreSink();
+  void set_packed_vertex_policy(bool (*policy)()) {
+    packed_vertex_policy_ = policy;
+  }
 
   void set_guest_resolver(const DolGuestAddressResolver* resolver) {
     consumer_.set_guest_resolver(resolver);
@@ -197,6 +203,7 @@ private:
   std::vector<gxruntime::aurora_recomp::RenderStatePacket> since_draw_;
   bool replay_overflow_ = false;
   CachedVertexAttrs cached_attrs_{}; // cross-draw N/B/T fallback (stream order)
+  bool (*packed_vertex_policy_)() = nullptr;
   DrawPlan scratch_plan_{};          // reused by on_consumed_draw
   PlanObserver plan_observer_ = nullptr;
   void* plan_observer_user_ = nullptr;
