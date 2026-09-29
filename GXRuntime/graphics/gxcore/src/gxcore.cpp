@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -128,11 +129,26 @@ void decode_scissor(DrawPlan& plan, std::uint32_t tl, std::uint32_t br,
 
 void GxCoreState::reset() { *this = GxCoreState{}; }
 
+// A version no other state, and no earlier change of this one, has: the
+// thread's own count, tagged with the thread, so no atomic operation is needed
+// and none is ever reused. A copy of a state carries its version with its
+// registers; a reset state, like a new one, is version 0 with every register
+// at its default.
+std::uint64_t GxCoreState::next_version() {
+  static std::atomic<std::uint32_t> s_threads{0};
+  static thread_local const std::uint64_t s_tag =
+      static_cast<std::uint64_t>(s_threads.fetch_add(1, std::memory_order_relaxed) + 1u) << 40;
+  static thread_local std::uint64_t s_count = 0;
+  return s_tag | ++s_count;
+}
+
 void GxCoreState::apply(const ar::RenderStatePacket& state) {
   using ar::RenderStateKind;
   switch (state.kind) {
   case RenderStateKind::BpReg:
     if (state.index < 256u) {
+      if (!bp_valid_[state.index] || bp_regs_[state.index] != state.value)
+        version_ = next_version();
       bp_regs_[state.index] = state.value;
       bp_valid_[state.index] = true;
       // TEV color/konst registers (BP 0xE0-0xE7, TevReg RA/BG). The TevRegType
@@ -158,15 +174,21 @@ void GxCoreState::apply(const ar::RenderStatePacket& state) {
     break;
   case RenderStateKind::CpVcd:
     if (state.index == 0u) {
+      if (!vcd_lo_valid_ || vcd_lo_ != state.value)
+        version_ = next_version();
       vcd_lo_ = state.value;
       vcd_lo_valid_ = true;
     } else {
+      if (!vcd_hi_valid_ || vcd_hi_ != state.value)
+        version_ = next_version();
       vcd_hi_ = state.value;
       vcd_hi_valid_ = true;
     }
     break;
   case RenderStateKind::CpVat:
     if (state.index < 8u && state.aux0 < 3u) {
+      if ((vat_valid_[state.index] & (1u << state.aux0)) == 0u || vat_[state.index][state.aux0] != state.value)
+        version_ = next_version();
       vat_[state.index][state.aux0] = state.value;
       vat_valid_[state.index] |= static_cast<std::uint8_t>(1u << state.aux0);
     }
@@ -660,15 +682,20 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw &draw,
   }
   // Cache only register-derived pipeline state. Geometry, mutable guest
   // arrays, uniforms, texture bytes and cross-draw NBT remain live each draw.
-  // Thread-local storage keeps separate FIFO consumers independent; the key
-  // includes values, not object addresses or a reusable generation number.
+  // Thread-local storage keeps separate FIFO consumers independent. The key is
+  // the register state's version (next_version: never reused, carried by a
+  // copy) with the vertex format it reads, and the draw's own transform,
+  // channel, light and texture values - where it was every register, 2 KB
+  // copied and compared at each of thousands of draws a frame.
   struct DerivedCache {
-    std::array<std::uint8_t,
-               sizeof(bp_regs_) + sizeof(bp_valid_) + 20 +
-                   sizeof(draw.xf_regs) + sizeof(draw.xf_reg_mask) +
-                   sizeof(draw.chan_regs) + sizeof(draw.chan_reg_mask) +
-                   sizeof(draw.light_word_mask) + 9 * 6 * 4>
-        input{};
+    std::uint64_t version = 0;
+    std::uint32_t vtx_fmt = 0;
+    std::uint32_t xf_regs[DOL_GX_RECOMP_XF_REG_COUNT]{};
+    decltype(draw.xf_reg_mask) xf_reg_mask{};
+    std::uint32_t chan_regs[DOL_GX_RECOMP_CHAN_REG_COUNT]{};
+    decltype(draw.chan_reg_mask) chan_reg_mask{};
+    std::uint16_t light_word_mask[DOL_GX_RECOMP_LIGHT_COUNT]{};
+    std::array<std::uint32_t, 9 * 6> textures{};
     PipelineKey pipeline{};
     GapCounters delta{};
     bool valid = false;
@@ -684,30 +711,26 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw &draw,
     const char *value = std::getenv("DOL_GXCORE_DERIVED_CACHE");
     return !value || std::strcmp(value, "0") != 0;
   }();
-  decltype(derived.input) input{};
-  auto *cursor = input.data();
-  auto append = [&](const void *data, std::size_t size) {
-    std::memcpy(cursor, data, size);
-    cursor += size;
-  };
-  append(bp_regs_, sizeof(bp_regs_));
-  append(bp_valid_, sizeof(bp_valid_));
-  append(&vcd_lo_, 4);
-  append(&vcd_hi_, 4);
-  append(vat_[draw.vtx_fmt], 12);
-  append(draw.xf_regs, sizeof(draw.xf_regs));
-  append(&draw.xf_reg_mask, sizeof(draw.xf_reg_mask));
-  append(draw.chan_regs, sizeof(draw.chan_regs));
-  append(&draw.chan_reg_mask, sizeof(draw.chan_reg_mask));
-  append(draw.light_word_mask, sizeof(draw.light_word_mask));
-  auto texture_key = [&](const ar::ConsumedTexture &t) {
-    const std::uint32_t values[] = {t.valid,  t.resolved, t.slot,
-                                    t.format, t.width,    t.height};
-    append(values, sizeof(values));
-  };
-  texture_key(draw.texture);
-  for (const auto &t : draw.textures)
-    texture_key(t);
+  static_assert(sizeof(draw.xf_regs) == sizeof(derived.xf_regs) &&
+                    sizeof(draw.chan_regs) == sizeof(derived.chan_regs) &&
+                    sizeof(draw.light_word_mask) == sizeof(derived.light_word_mask),
+                "the derived cache mirrors the draw's register arrays");
+  std::array<std::uint32_t, 9 * 6> textures;
+  {
+    std::uint32_t *out = textures.data();
+    auto texture_key = [&](const ar::ConsumedTexture &t) {
+      out[0] = t.valid;
+      out[1] = t.resolved;
+      out[2] = t.slot;
+      out[3] = t.format;
+      out[4] = t.width;
+      out[5] = t.height;
+      out += 6;
+    };
+    texture_key(draw.texture);
+    for (const auto &t : draw.textures)
+      texture_key(t);
+  }
   static constexpr auto counter_members = std::array{
       &GapCounters::dst_alpha_active,
       &GapCounters::early_depth_active,
@@ -742,7 +765,12 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw &draw,
   };
   ShaderKey& key = plan.pipeline.shader;
   PipelineKey &pipe = plan.pipeline;
-  if (cache_enabled && derived.valid && input == derived.input) {
+  if (cache_enabled && derived.valid && derived.version == version_ &&
+      derived.vtx_fmt == draw.vtx_fmt && derived.xf_reg_mask == draw.xf_reg_mask &&
+      derived.chan_reg_mask == draw.chan_reg_mask && derived.textures == textures &&
+      std::memcmp(derived.xf_regs, draw.xf_regs, sizeof(derived.xf_regs)) == 0 &&
+      std::memcmp(derived.chan_regs, draw.chan_regs, sizeof(derived.chan_regs)) == 0 &&
+      std::memcmp(derived.light_word_mask, draw.light_word_mask, sizeof(derived.light_word_mask)) == 0) {
     plan.pipeline = derived.pipeline;
     for (auto member : counter_members)
       counters.*member += derived.delta.*member;
@@ -1148,7 +1176,14 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw &draw,
     if (bits(cmode0, 1, 1) != 0u)
       ++counters.logic_op_ignored;
 
-    derived.input = input;
+    derived.version = version_;
+    derived.vtx_fmt = draw.vtx_fmt;
+    std::memcpy(derived.xf_regs, draw.xf_regs, sizeof(derived.xf_regs));
+    derived.xf_reg_mask = draw.xf_reg_mask;
+    std::memcpy(derived.chan_regs, draw.chan_regs, sizeof(derived.chan_regs));
+    derived.chan_reg_mask = draw.chan_reg_mask;
+    std::memcpy(derived.light_word_mask, draw.light_word_mask, sizeof(derived.light_word_mask));
+    derived.textures = textures;
     derived.pipeline = plan.pipeline;
     derived.valid = true;
     for (auto member : counter_members)

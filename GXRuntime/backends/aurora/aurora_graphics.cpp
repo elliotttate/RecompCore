@@ -488,8 +488,12 @@ void g_fifo_translate(std::vector<std::uint8_t>& batch) {
 }
 
 void g_fifo_worker_main() {
+    // Kept across batches: the swap below hands its capacity back to the
+    // handoff, so the game thread's appends reuse it instead of growing a new
+    // vector (and this thread freeing the old one) every batch.
+    std::vector<std::uint8_t> batch;
     for (;;) {
-        std::vector<std::uint8_t> batch;
+        batch.clear();
         std::uint64_t parsed = 0;
         {
             std::unique_lock<std::mutex> lock(g_fifo_worker_mutex);

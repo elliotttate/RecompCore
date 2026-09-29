@@ -143,6 +143,11 @@ private:
   bool vcd_hi_valid_ = false;
   std::uint32_t vat_[8][3]{};
   std::uint8_t vat_valid_[8]{}; // bit per group
+  // Changes with every change apply() makes to the BP, VCD and VAT registers
+  // (next_version); build_draw_plan_into's cache of the state derived from
+  // them compares it instead of the registers.
+  std::uint64_t version_ = 0;
+  static std::uint64_t next_version();
 };
 
 // AuroraRenderSink that owns a ConsumingAuroraRenderSink (streaming mode) and
