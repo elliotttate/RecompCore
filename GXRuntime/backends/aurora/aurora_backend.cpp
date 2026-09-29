@@ -185,6 +185,9 @@ void install_platform_ops() {
         .present = aurora_backend_present,
         .mark_gx_begin = aurora_backend_mark_gx_begin,
         .gx_write = aurora_backend_gx_write,
+        // The FIFO is a byte stream only through the GX core, and a trace
+        // records each write with its size.
+        .gx_write_bytes = g_gx_core_enabled && !g_trace_armed ? aurora_backend_gx_write_bytes : nullptr,
         .gx_flush = aurora_backend_gx_flush,
         .call_display_list = aurora_backend_call_display_list,
         .set_array = aurora_backend_set_array,

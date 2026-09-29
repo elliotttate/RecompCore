@@ -866,6 +866,30 @@ static inline void shadow_frontend_enqueue_word(u64 value, u8 size) {
         g_fifo_publish_local();
 }
 
+// A run of consecutive gather-pipe writes, their bytes in guest order, for the
+// running translation worker: shadow_frontend_enqueue_word's bookkeeping for
+// the run, and the bytes appended to the worker's batch in pieces that publish
+// it at the same limit.
+static inline void shadow_frontend_enqueue_bytes(const std::uint8_t* bytes, std::size_t size) {
+    g_shadow_frontend_pending_bytes += size;
+    const std::size_t limit = fifo_local_batch_limit();
+    while (size != 0u) {
+        if (g_fifo_local_size >= limit) {
+            g_fifo_publish_local();
+            continue;
+        }
+        std::size_t piece = limit - g_fifo_local_size;
+        if (piece > size)
+            piece = size;
+        std::memcpy(g_fifo_local + g_fifo_local_size, bytes, piece);
+        g_fifo_local_size += piece;
+        bytes += piece;
+        size -= piece;
+        if (g_fifo_local_size >= limit)
+            g_fifo_publish_local();
+    }
+}
+
 void shadow_frontend_write(u64 value, u8 size) {
     if (!g_shadow_frontend_enabled || g_shadow_frontend_failed)
         return;
@@ -1646,6 +1670,26 @@ void aurora_backend_gx_flush(void) {
         return;
     gx_aurora::shadow_frontend_flush_pending();
 #endif
+}
+
+// A run of consecutive gather-pipe writes as their bytes in guest order (the
+// game module's batch). Installed only where the FIFO is a byte stream - the
+// GX core on and nothing traced (install_platform_ops) - so a byte at a time
+// through aurora_backend_gx_write is the same stream as the writes it came
+// from; in play the run goes to the worker's batch in one piece.
+void aurora_backend_gx_write_bytes(const u8* bytes, u32 size) {
+#if GXRUNTIME_HAS_AURORA_RECOMP
+    if (gx_aurora::g_initialized && gx_aurora::g_gx_core_enabled && gx_aurora::g_frame_open &&
+        !gx_aurora::g_trace_armed && gx_aurora::g_fifo_worker_started &&
+        gx_aurora::g_shadow_frontend_enabled && !gx_aurora::g_shadow_frontend_failed &&
+        !gx_aurora::g_display_copy_pending.load(std::memory_order_relaxed)) {
+        gx_aurora::g_fifo_bytes += size;
+        gx_aurora::shadow_frontend_enqueue_bytes(bytes, size);
+        return;
+    }
+#endif
+    for (u32 i = 0; i < size; ++i)
+        aurora_backend_gx_write(bytes[i], 1u);
 }
 
 void aurora_backend_gx_write(u64 value, u8 size) {

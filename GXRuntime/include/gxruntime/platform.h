@@ -32,6 +32,10 @@ typedef struct DolPlatformOps {
 
     void (*mark_gx_begin)(void);
     void (*gx_write)(u64 value, u8 size);
+    // Consecutive gather-pipe writes as their bytes in guest order, for a
+    // backend whose FIFO parser takes a byte stream (the write sizes do not
+    // matter to it). NULL where they do: the host then sends writes one by one.
+    void (*gx_write_bytes)(const u8* bytes, u32 size);
     void (*gx_flush)(void);
     void (*call_display_list)(const void* data, u32 size);
     void (*set_array)(u32 attr, const void* data, u32 size, u8 stride);
@@ -74,6 +78,11 @@ bool dol_platform_should_quit(void);
 void dol_platform_present(void);
 void dol_platform_mark_gx_begin(void);
 void dol_platform_gx_write(u64 value, u8 size);
+// Whether the backend takes gather-pipe writes as a byte stream
+// (DolPlatformOps.gx_write_bytes), and a run of them in guest byte order. A
+// caller that has not asked gets a backend without it one byte at a time.
+bool dol_platform_gx_write_bytes_available(void);
+void dol_platform_gx_write_bytes(const u8* bytes, u32 size);
 // Parse whatever the FIFO write path has buffered. The host calls this where the
 // guest is about to observe GPU progress - the draw-done commit - so the
 // translation is never behind a wait it is supposed to satisfy.

@@ -47,6 +47,19 @@ void dol_platform_gx_write(u64 value, u8 size) {
         g_ops.gx_write(value, size);
 }
 
+bool dol_platform_gx_write_bytes_available(void) {
+    return g_ops.gx_write_bytes != NULL;
+}
+
+void dol_platform_gx_write_bytes(const u8* bytes, u32 size) {
+    if (g_ops.gx_write_bytes != NULL) {
+        g_ops.gx_write_bytes(bytes, size);
+        return;
+    }
+    for (u32 i = 0; i < size; ++i)
+        dol_platform_gx_write(bytes[i], 1);
+}
+
 void dol_platform_gx_flush(void) {
     if (g_ops.gx_flush != NULL)
         g_ops.gx_flush();
