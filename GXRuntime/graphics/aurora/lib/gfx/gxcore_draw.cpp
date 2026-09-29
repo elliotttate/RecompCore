@@ -1002,24 +1002,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   }
 
   if (plan.viewport_valid) {
-    // Raw XF viewport -> logical viewport, the raw path's own formula
-    // (gx/command_processor.cpp XF 0x1A case).
-    const float sx = plan.viewport[0];
-    const float sy = plan.viewport[1];
-    const float sz = plan.viewport[2];
-    const float ox = plan.viewport[3];
-    const float oy = plan.viewport[4];
-    const float oz = plan.viewport[5];
-    const float width = sx * 2.0f;
-    const float height = -sy * 2.0f;
-    gx::set_logical_viewport({
-        .left = ox - 340.0f - width / 2.0f,
-        .top = oy - 340.0f - height / 2.0f,
-        .width = width,
-        .height = height,
-        .znear = (oz - sz) / 1.6777215e7f,
-        .zfar = oz / 1.6777215e7f,
-    });
+    gx::set_logical_viewport(retail_viewport(plan.viewport));
   }
   if (plan.scissor_valid) {
     // Wind Waker draws its 2D layer (HUD, menus and the fade to and from

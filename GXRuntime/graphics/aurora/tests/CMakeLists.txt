@@ -118,7 +118,7 @@ target_link_libraries(os_alloc_tests PRIVATE gtest gtest_main fmt::fmt)
 gtest_discover_tests(os_alloc_tests)
 
 if (TARGET GXRuntime::gxcore)
-  add_executable(gxcore_merge_tests gxcore_merge_test.cpp)
+  add_executable(gxcore_merge_tests gxcore_merge_test.cpp gxcore_viewport_test.cpp)
   target_include_directories(gxcore_merge_tests PRIVATE ../include ../lib)
   target_compile_definitions(gxcore_merge_tests PRIVATE AURORA TARGET_PC)
   target_link_libraries(gxcore_merge_tests PRIVATE GXRuntime::gxcore gtest gtest_main
