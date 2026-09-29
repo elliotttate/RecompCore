@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 namespace aurora::gfx::gxcore {
@@ -178,7 +179,18 @@ wgpu::SamplerDescriptor sampler_descriptor(const gxc::PlanSampler& sampler) {
 // t occupies binding 2t (texture) + 2t+1 (sampler), matching the WGSL. Cached per
 // mask; used_mask=1 (texmap 0 only) reproduces the pre-Mfin single-texmap layout.
 wgpu::BindGroupLayout texture_bind_group_layout(uint32_t used_mask = 1u) {
+  // Both the pipeline compiler and FIFO submission use this cache. A lookup
+  // concurrent with flat_hash_map growth can read an invalid layout handle.
+  static std::mutex mutex;
+  std::lock_guard lock{mutex};
   static absl::flat_hash_map<uint32_t, wgpu::BindGroupLayout> cache;
+  // Retaining the owner also prevents pointer reuse from matching a dead
+  // device after renderer reinitialization.
+  static wgpu::Device owner;
+  if (owner.Get() != g_device.Get()) {
+    cache.clear();
+    owner = g_device;
+  }
   auto it = cache.find(used_mask);
   if (it != cache.end())
     return it->second;
