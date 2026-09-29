@@ -240,6 +240,12 @@ bool dol_aurora_initialize(int argc, char** argv,
         backend_config->app_name != nullptr ? backend_config->app_name
                                             : defaults.app_name;
     config.desiredBackend = BACKEND_AUTO;
+    // DOL_AURORA_CACHE_DIR: where the shader and pipeline caches live
+    // (default: SDL's preference folder for the app name). A host that keeps
+    // several data folders points each at its own, so two copies running at
+    // once never write one SQLite file together.
+    if (const char* cache_dir = std::getenv("DOL_AURORA_CACHE_DIR"); cache_dir != nullptr && cache_dir[0] != '\0')
+        config.cachePath = strdup(cache_dir);
     config.vsync = backend_config->vsync;
     config.windowWidth = backend_config->window_width != 0
                              ? backend_config->window_width
