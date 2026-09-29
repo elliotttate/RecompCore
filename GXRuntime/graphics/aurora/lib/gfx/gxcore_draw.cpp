@@ -1469,7 +1469,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // break adjacency through get_last_draw_command.
   if (merge_enabled && previous && can_merge_draws(*previous, data)) {
     const auto base = static_cast<uint16_t>(previous->vertRange.size / vertexStride);
-    rebase_indices_u16(data.idxRange, base);
+    rebase_indices_u16(data.idxRange, plan.indices.data(), base);
     previous->vertRange.size += data.vertRange.size;
     previous->idxRange.size += data.idxRange.size;
     previous->indexCount += data.indexCount;

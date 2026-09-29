@@ -2188,15 +2188,19 @@ Range push_indices(const uint8_t* data, size_t length, size_t alignment) {
   return push(current_frame_packet().indices, data, length, alignment);
 }
 
-void rebase_indices_u16(Range range, uint16_t base) {
+// Writes source + base over an index range already pushed from source. Only
+// writes: the frame's staging memory is a mapped GPU buffer, write-combined on
+// Direct3D 12, where reading each index back cost an uncached read - a third
+// of the translation worker at native 60 Hz.
+void rebase_indices_u16(Range range, const uint16_t* source, uint16_t base) {
   auto& bytes = current_frame_packet().indices;
   CHECK(range.offset + range.size <= bytes.size() && range.size % 2 == 0, "Invalid index rebase range");
-  for (uint32_t offset = range.offset; offset < range.offset + range.size; offset += 2) {
-    uint16_t value;
-    std::memcpy(&value, bytes.data() + offset, 2);
-    CHECK(uint32_t(value) + base <= 65535u, "Merged index overflow");
-    value += base;
-    std::memcpy(bytes.data() + offset, &value, 2);
+  uint8_t* const destination = bytes.data() + range.offset;
+  const uint32_t count = range.size / 2;
+  for (uint32_t i = 0; i < count; ++i) {
+    CHECK(uint32_t(source[i]) + base <= 65535u, "Merged index overflow");
+    const uint16_t value = static_cast<uint16_t>(source[i] + base);
+    std::memcpy(destination + 2u * i, &value, 2);
   }
 }
 

@@ -299,7 +299,7 @@ static Range push_verts(ArrayRef<T> data, size_t alignment) {
   return push_verts(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T), alignment);
 }
 Range push_indices(const uint8_t* data, size_t length, size_t alignment);
-void rebase_indices_u16(Range range, uint16_t base);
+void rebase_indices_u16(Range range, const uint16_t* source, uint16_t base);
 template <typename T>
 static Range push_indices(ArrayRef<T> data, size_t alignment) {
   return push_indices(reinterpret_cast<const uint8_t*>(data.data()), data.size() * sizeof(T), alignment);
