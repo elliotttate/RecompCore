@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 
 namespace gxruntime::gxcore {
 
@@ -563,7 +564,11 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw &draw,
     std::vector<float> vertices = std::move(plan.vertices);
     auto packed = std::move(plan.packed_vertices);
     std::vector<std::uint16_t> indices = std::move(plan.indices);
-    plan = DrawPlan{};
+    // Re-constructed in place: assigning a DrawPlan{} built the zeroed
+    // temporary and then copied all of it (the shader constants are several
+    // KB) over the plan, at every draw.
+    std::destroy_at(&plan);
+    std::construct_at(&plan);
     vertices.clear();
     packed.clear();
     indices.clear();
