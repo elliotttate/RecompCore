@@ -331,9 +331,12 @@ Range push_interp_vertices(size_t slot, const uint8_t* data, size_t length);
 // A job's in-between blocks and vertices, one per in-between frame of the
 // game frame (frame_interp::frame_steps; either empty when the draw keeps its
 // own).
+// At most kInterpMaxSteps of each (frame_interp::kMaxSteps, which common.cpp
+// checks it against).
+constexpr int kInterpMaxSteps = 7;
 struct InterpRanges {
-  Range uniform[3];
-  Range verts[3];
+  Range uniform[kInterpMaxSteps];
+  Range verts[kInterpMaxSteps];
 };
 void resolve_interp_job(size_t slot, const InterpRanges& ranges);
 // One draw of a batch (gxcore_draw.cpp): its indices' count, and its first

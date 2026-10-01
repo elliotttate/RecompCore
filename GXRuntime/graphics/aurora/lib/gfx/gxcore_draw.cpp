@@ -1689,8 +1689,11 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // In-between frames: matched on the helper thread (queued below), or here
   // while a traced frame reports each draw's outcome. Here it is matched
   // before a staging segment can split the frame; a split frame is not
-  // interpolated.
-  const bool interpolating = frame_interp::enabled();
+  // interpolated. A frame the pacing gave no in-between frames
+  // (frame_skipped) queues nothing: matching its draws would only cost the
+  // CPU it was dropped for, and the frame after has no previous to blend from
+  // (as after a cut).
+  const bool interpolating = frame_interp::enabled() && !frame_interp::frame_skipped();
   const bool matchHere = interpolating && frame_interp::tracing();
   if (matchHere)
     wait_interp_jobs();

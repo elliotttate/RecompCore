@@ -256,9 +256,11 @@ static std::array<FramePacket, FrameSlotCount> g_framePackets;
 // blocks of a busy scene came to about 55 MB, and past 32 the rest did not
 // fit, so those draws kept the next frame's transforms in two of the three in-
 // between frames (the sea on a beach blinked out and back). The GPU buffer
-// grows to what a frame uses (upload_interp_data).
+// grows to what a frame uses (upload_interp_data), so the limit for the
+// most in-between frames (frame_interp::kMaxSteps, at a 240 Hz display)
+// costs nothing at 60 or 120.
 constexpr uint64_t InterpUniformStepSize = 33554432; // 32mb
-constexpr uint64_t InterpUniformBufferSize = InterpUniformStepSize * 3;
+constexpr uint64_t InterpUniformBufferSize = InterpUniformStepSize * frame_interp::kMaxSteps;
 static uint64_t g_interpUniformBufferSize = 0; // the GPU buffer's size (render worker)
 // Per frame slot, the range each in-between job resolved to, in job order
 // (gxcore_draw.cpp's helper writes them; end_frame waits for it).
@@ -266,8 +268,17 @@ static std::array<std::vector<InterpRanges>, FrameSlotCount> g_interpJobRanges;
 // Per frame slot, the parts of its batched GXCore draws (push_batch_draw).
 static std::array<std::vector<BatchDraw>, FrameSlotCount> g_batchDraws;
 // A particle's blended vertices, per frame slot (see push_interp_vertices).
-constexpr uint64_t InterpVertexBufferSize = 8388608; // 8mb
+// 8 MB was the limit for three in-between frames, so the limit is that
+// third (rounded to 256 bytes: a mapped buffer's size and a copy's must be
+// multiples of 4, and 8 MB / 3 * 7 was not, so no staging buffer could be
+// made and no frame had in-between frames) for each of kMaxSteps. The GPU
+// buffer starts at 8 MB and grows to what a frame uses (upload_interp_data).
+constexpr uint64_t InterpVertexStepSize = 2796288;
+constexpr uint64_t InterpVertexBufferSize = InterpVertexStepSize * frame_interp::kMaxSteps;
+constexpr uint64_t InterpVertexStartSize = 8388608;
+static_assert(InterpVertexStepSize * 3 >= 8388608 && InterpVertexStepSize % 256 == 0);
 wgpu::Buffer g_interpVertexBuffer;
+static uint64_t g_interpVertexBufferSize = 0; // the GPU buffer's size (render worker)
 // Both are written, while a frame records, straight into a staging buffer
 // mapped for it, and copied to their GPU buffers on the GPU when the frame is
 // rendered (upload_interp_data). Staged in memory and sent with
@@ -306,7 +317,7 @@ static std::array<InterpSlot, FrameSlotCount> g_interpSlots;
 // did not fit (recording thread). That frame shows no in-between frames:
 // with some of its draws left out of them, those would blink.
 static uint64_t g_interpUniformWant = 0;
-static uint64_t g_interpVertexWant = InterpVertexBufferSize / 2;
+static uint64_t g_interpVertexWant = InterpVertexStartSize / 2;
 static bool g_interpOverflowed = false; // helper thread, read after wait_interp_jobs
 static size_t g_replayFrameSlot = 0; // render worker: the frame whose in-between frame is encoded
 static int g_replayStep = 0;          // render worker: which of its in-between frames
@@ -350,7 +361,10 @@ static webgpu::TextureWithSampler g_heldFrame; // the real frame, kept for its l
 // presents, in two sets that alternate between game frames so a new frame
 // never has to show the one before's early; and the time the last present
 // was scheduled for, the clock the next frame's continue.
-static webgpu::TextureWithSampler g_heldSteps[2][4];
+// Each set: the in-between frames (0..kMaxSteps-1), then the real frame.
+static webgpu::TextureWithSampler g_heldSteps[2][frame_interp::kMaxSteps + 1];
+static constexpr int kHeldReal = frame_interp::kMaxSteps;
+static_assert(kInterpMaxSteps == frame_interp::kMaxSteps);
 static int g_heldSet = 0;
 static PresentClock::time_point g_lastDue{};
 static bool g_heldShown = false;                 // the screen shows g_heldFrame (render worker)
@@ -1281,7 +1295,7 @@ void shutdown() {
   }
   g_interpSlots = {};
   g_interpUniformWant = 0;
-  g_interpVertexWant = InterpVertexBufferSize / 2;
+  g_interpVertexWant = InterpVertexStartSize / 2;
   g_interpOverflowed = false;
   g_lastGameFrameEnd = {};
   g_gameFramePeriodNs = 0;
@@ -2149,11 +2163,14 @@ static void upload_interp_data(size_t frameSlot) {
     };
     g_interpUniformBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
   }
-  if (vertexBytes != 0 && !g_interpVertexBuffer) {
+  if (vertexBytes != 0 && (!g_interpVertexBuffer || g_interpVertexBufferSize < vertexBytes)) {
+    const uint64_t wanted = std::max(vertexBytes, InterpVertexStartSize);
+    g_interpVertexBufferSize = std::min(
+        InterpVertexBufferSize, (wanted + InterpVertexStepSize - 1) / InterpVertexStepSize * InterpVertexStepSize);
     const wgpu::BufferDescriptor descriptor{
         .label = "In-between frame vertex buffer",
         .usage = wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst,
-        .size = InterpVertexBufferSize,
+        .size = g_interpVertexBufferSize,
     };
     g_interpVertexBuffer = g_device.CreateBuffer(&descriptor);
   }
@@ -2243,12 +2260,12 @@ static void present_with_in_between(FramePacket& frame, size_t frameSlot, wgpu::
 static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEncoder& encoder,
                           const EndFrameCallback& callback, int steps) {
   ZoneScopedN("Present with in-between frames");
-  steps = std::clamp(steps, 1, 3);
+  steps = std::clamp(steps, 1, frame_interp::kMaxSteps);
   g_heldSet ^= 1;
   auto& held = g_heldSteps[g_heldSet];
   // The set this frame takes was the one two frames ago: anything of it still
   // waiting is shown now.
-  flush_presents_from(&held[0], &held[3]);
+  flush_presents_from(&held[0], &held[kHeldReal]);
   const auto keep = [](wgpu::CommandEncoder& commands, webgpu::TextureWithSampler& copy) {
     const auto& source = webgpu::present_source();
     ensure_held_texture(copy, source);
@@ -2258,7 +2275,7 @@ static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEnc
     commands.CopyTextureToTexture(&src, &dst, &extent);
   };
   // 1. The real frame, kept aside.
-  keep(encoder, held[3]);
+  keep(encoder, held[kHeldReal]);
   webgpu::gpu_prof::frame_end(encoder);
   {
     const wgpu::CommandBufferDescriptor descriptor{.label = "Real frame command buffer"};
@@ -2269,7 +2286,7 @@ static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEnc
   after_submit();
   const bool dump = frame_interp::dump_frame(frame.gameFrame);
   if (dump) {
-    dump_texture(held[3], "real", frame.gameFrame);
+    dump_texture(held[kHeldReal], "real", frame.gameFrame);
   }
   deferred_present_tick();
 
@@ -2279,7 +2296,9 @@ static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEnc
   const auto interval = step_offset(1, steps);
   PresentClock::time_point base{};
   static constexpr wgpu::CommandEncoderDescriptor EncoderDescriptor{.label = "In-between frame encoder"};
-  static const char* const kDumpNames[] = {"between", "between2", "between3"};
+  static const char* const kDumpNames[] = {"between",  "between2", "between3", "between4",
+                                          "between5", "between6", "between7"};
+  static_assert(std::size(kDumpNames) == frame_interp::kMaxSteps);
   for (int step = 0; step < steps; ++step) {
     auto between = g_device.CreateCommandEncoder(&EncoderDescriptor);
     g_replayStep = step;
@@ -2310,7 +2329,7 @@ static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEnc
   g_replayStep = 0;
   // 3. The real frame after them.
   g_lastDue = base + interval * steps;
-  defer_present(g_lastDue, &held[3], callback, frame.gameFrame, -1);
+  defer_present(g_lastDue, &held[kHeldReal], callback, frame.gameFrame, -1);
   deferred_present_tick();
 }
 
@@ -2346,7 +2365,7 @@ static void present_held(wgpu::CommandEncoder& encoder, const EndFrameCallback& 
   }
   webgpu::gpu_prof::after_submit();
   after_submit();
-  steps = std::clamp(steps, 1, 3);
+  steps = std::clamp(steps, 1, frame_interp::kMaxSteps);
   defer_present(PresentClock::now() + step_offset(steps, steps), &g_heldFrame, callback);
   g_lastDue = {};
 }

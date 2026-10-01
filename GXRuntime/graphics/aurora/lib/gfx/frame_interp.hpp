@@ -38,7 +38,9 @@ void set_enabled(bool enabled) noexcept;
 // In-between frames per game frame: 1 (60 Hz from 30) or 3 (120 Hz), at
 // t = step / (steps + 1). A change takes effect at the next game frame;
 // frame_steps() is the recording frame's.
-constexpr int kMaxSteps = 3;
+// In-between frames a game frame, at most: 7 shows 240 a second (a 240 Hz
+// display), 3 shows 120 and 1 shows 60.
+constexpr int kMaxSteps = 7;
 void set_steps(int steps) noexcept;
 int steps() noexcept;
 int frame_steps() noexcept;

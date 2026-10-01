@@ -4,6 +4,7 @@
 #include <bit>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -35,7 +36,7 @@ uint64_t env_u64(const char* name, uint64_t fallback) {
 std::atomic_bool g_enabled{env_flag("DOL_AURORA_FRAME_INTERP", false)};
 // In-between frames per game frame (1: 60 Hz, 3: 120 Hz; DOL_AURORA_FRAME_INTERP_STEPS),
 // asked for at any time and taken at a game frame's start (g_frameSteps).
-std::atomic<int> g_steps{static_cast<int>(std::clamp<uint64_t>(env_u64("DOL_AURORA_FRAME_INTERP_STEPS", 1), 1, 3))};
+std::atomic<int> g_steps{static_cast<int>(std::clamp<uint64_t>(env_u64("DOL_AURORA_FRAME_INTERP_STEPS", 1), 1, kMaxSteps))};
 int g_frameSteps = g_steps.load(std::memory_order_relaxed);
 // In-between frames need not make the game wait (pace_steps): when the GPU
 // or the render worker keeps falling behind (note_overload), 60 Hz drops to
@@ -52,6 +53,11 @@ struct Pacing {
   int calm = 0;    // game frames since the last overload
   int calmNeeded = 0;
   uint32_t recent = 0; // one bit a game frame, newest lowest: an overload reported
+  // The game's own speed (slow_game): when the last game frame ended here,
+  // and the running average of the gaps between them.
+  std::chrono::steady_clock::time_point lastEnd{};
+  double gapMs = 0.0;
+  int gaps = 0;
 } g_pacing;
 std::atomic_bool g_encodingInterpolated{false};
 std::atomic<uint64_t> g_gameFrame{1};
@@ -1809,6 +1815,32 @@ void note_overload(const char* why) noexcept {
   g_overloaded.store(true, std::memory_order_relaxed);
 }
 
+// The game itself below full speed: its frames ended here more than
+// kSlowGapMs apart on average over the last 8 or so (under 28.2 a second
+// against the game's 29.97). On a CPU with few cores the in-between frames'
+// work (each draw captured here and matched on the helper thread, the
+// render worker drawing them again) takes cores the game's own thread
+// needs, and the game ran in slow motion: 24-27 game frames a second on 4
+// of the i9's E-cores at 60 FPS, 30 with frame interpolation off. A gap of
+// a quarter second or more (a load, a pause, a hidden window) is not the
+// game's speed and starts the average again.
+static bool slow_game(Pacing& p) {
+  static constexpr double kSlowGapMs = 35.5;
+  const auto now = std::chrono::steady_clock::now();
+  const auto last = p.lastEnd;
+  p.lastEnd = now;
+  if (last == std::chrono::steady_clock::time_point{})
+    return false;
+  const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+  if (ms >= 250.0) {
+    p.gaps = 0;
+    return false;
+  }
+  p.gapMs = p.gaps == 0 ? ms : p.gapMs + (ms - p.gapMs) / 8.0;
+  p.gaps = std::min(p.gaps + 1, 8);
+  return p.gaps >= 8 && p.gapMs > kSlowGapMs;
+}
+
 // Recording thread, between game frames: the next frame's in-between frames.
 // Overloads (the GPU a frame behind, or the game waiting on rendering) in 3 of
 // the last 8 game frames take 60 Hz to none (and 120 Hz to 60, when pacing
@@ -1823,6 +1855,7 @@ void note_overload(const char* why) noexcept {
 static void pace_steps() {
   static constexpr int kCalmStart = 90;  // game frames, 3 s
   static constexpr int kCalmMost = 900;  // 30 s
+  static constexpr int kCalmMostSlow = 3600; // 2 min, after the game itself ran slow
   static constexpr uint64_t kSettle = 4; // game frames between drops
   static constexpr uint64_t kSoon = 300; // an overload within 10 s of coming back
   // DOL_AURORA_FRAME_INTERP_PACING: 0 never lowers them, 1 lowers 120 Hz's
@@ -1836,24 +1869,36 @@ static void pace_steps() {
   auto& p = g_pacing;
   ++p.frame;
   const int wanted = g_steps.load(std::memory_order_relaxed);
-  const bool pacing = setting == 1 || (setting < 0 && wanted < kMaxSteps);
-  const bool overloaded = g_overloaded.exchange(false, std::memory_order_relaxed) && pacing;
+  const bool pacing = setting == 1 || (setting < 0 && wanted < 3);
+  // The game running slow counts at any number of in-between frames (slow
+  // motion is worse than fewer of them) unless pacing is off altogether.
+  const bool slow = slow_game(p) && setting != 0;
+  const bool overloaded = (g_overloaded.exchange(false, std::memory_order_relaxed) && pacing) || slow;
   p.recent = (p.recent << 1) | (overloaded ? 1u : 0u);
   const bool sustained = std::popcount(p.recent & 0xFFu) >= 3;
   if (wanted != p.wanted) {
-    p = Pacing{.frame = p.frame, .wanted = wanted, .budget = wanted, .calmNeeded = kCalmStart};
+    p = Pacing{.frame = p.frame, .wanted = wanted, .budget = wanted, .calmNeeded = kCalmStart,
+               .lastEnd = p.lastEnd};
   } else if (sustained) {
     p.calm = 0;
     if (p.budget > 0 && p.frame - p.lastDrop >= kSettle) {
       if (p.lastRaise != 0 && p.frame - p.lastRaise < kSoon)
-        p.calmNeeded = std::min(p.calmNeeded * 2, kCalmMost);
+        p.calmNeeded = std::min(p.calmNeeded * 2, slow ? kCalmMostSlow : kCalmMost);
       const int before = p.budget;
       p.budget = p.budget > 1 ? 1 : 0;
       p.lastDrop = p.frame;
       p.recent = 0;
       const char* why = g_overloadWhy.load(std::memory_order_relaxed);
-      std::fprintf(stderr, "[interp-pace] in-between frames %d -> %d (%s; back after %.0f s calm)\n", before,
-                   p.budget, why != nullptr ? why : "rendering fell behind", p.calmNeeded / 30.0);
+      if (slow) {
+        std::fprintf(stderr,
+                     "[interp-pace] in-between frames %d -> %d (the game ran below full speed, %.1f game "
+                     "frames a second; back after %.0f s calm)\n",
+                     before, p.budget, 1000.0 / p.gapMs, p.calmNeeded / 30.0);
+        p.gaps = 0; // the next drop on new frames' gaps
+      } else {
+        std::fprintf(stderr, "[interp-pace] in-between frames %d -> %d (%s; back after %.0f s calm)\n", before,
+                     p.budget, why != nullptr ? why : "rendering fell behind", p.calmNeeded / 30.0);
+      }
     }
   } else if (p.budget < wanted) {
     if (++p.calm >= p.calmNeeded) {
