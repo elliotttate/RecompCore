@@ -37,6 +37,14 @@ typedef enum {
   LOG_FATAL,
 } AuroraLogLevel;
 
+typedef enum {
+  FPS_OVERLAY_TOP_CENTER,
+  FPS_OVERLAY_TOP_LEFT,
+  FPS_OVERLAY_TOP_RIGHT,
+  FPS_OVERLAY_BOTTOM_LEFT,
+  FPS_OVERLAY_BOTTOM_RIGHT,
+} AuroraFpsOverlayPosition;
+
 typedef struct {
   int32_t x;
   int32_t y;
@@ -158,6 +166,10 @@ void aurora_set_frame_interpolation(bool enabled);
    rate beside it when in-between frames are on). DOL_AURORA_SHOW_FPS=1 sets
    the starting value. */
 void aurora_set_fps_overlay(bool enabled);
+/* Where the counter is drawn: the top center (unless set) or a corner. Takes
+   effect at the next frame. DOL_AURORA_FPS_POSITION (top-center, top-left,
+   top-right, bottom-left or bottom-right) sets the starting value. */
+void aurora_set_fps_overlay_position(AuroraFpsOverlayPosition position);
 bool aurora_get_frame_interpolation(void);
 /* In-between frames per game frame: 1 (60 FPS from the game's 30) or 3
    (120 FPS, for a 120 Hz display). DOL_AURORA_FRAME_INTERP_STEPS sets the

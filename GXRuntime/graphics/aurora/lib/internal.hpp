@@ -7,6 +7,7 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -124,6 +125,10 @@ namespace aurora {
 extern AuroraConfig g_config;
 extern uint32_t g_sdlCustomEventsStart;
 extern char g_gameName[4];
+// A DOL_AURORA_FPS_POSITION value as where the FPS counter goes: top-center,
+// top-left, top-right, bottom-left or bottom-right, and top center for anything
+// else.
+AuroraFpsOverlayPosition fps_overlay_position(std::string_view name) noexcept;
 
 template <typename T>
 class ArrayRef {
