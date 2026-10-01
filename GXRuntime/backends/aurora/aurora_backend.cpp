@@ -276,6 +276,8 @@ bool dol_aurora_initialize(int argc, char** argv,
     config.windowHeight = backend_config->window_height != 0
                               ? backend_config->window_height
                               : defaults.window_height;
+    config.windowPosX = backend_config->window_pos_x;
+    config.windowPosY = backend_config->window_pos_y;
     // The display the picture is made for (desktop hosts; iOS fills its
     // screen). DOL_AURORA_WINDOW=WxH sizes the window in points; otherwise a
     // widened picture (DOL_AURORA_ASPECT_RATIO) gets a window of its shape at
