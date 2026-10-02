@@ -349,6 +349,14 @@ bool dol_gx_recomp_note_xf_load(DolGxRecompState* gx, u16 base, u8 count);
 // loads carry no inline words, so callers pass data_be=NULL there.
 bool dol_gx_recomp_capture_xf_transform(DolGxRecompState* gx, u16 base, u8 count,
                                         const u8* data_be);
+// A number that changes whenever transform state a draw snapshots may have
+// changed: an XF load reaching any of it, matrix index A, an init, or (from
+// the caller) post-transform memory and a loaded state. Two draws with the
+// same number had the same XF state, so a consumer can keep what it derived
+// from the first (gxcore's vertex constants). One counter for the process,
+// outside DolGxRecompState so a saved state keeps its size. Never 0.
+u64 dol_gx_recomp_xf_version(void);
+void dol_gx_recomp_bump_xf_version(void);
 bool dol_gx_recomp_note_invalidate_vtx_cache(DolGxRecompState* gx);
 bool dol_gx_recomp_set_vertex_layout(DolGxRecompState* gx, u8 vtx_fmt,
                                      u32 vertex_size);

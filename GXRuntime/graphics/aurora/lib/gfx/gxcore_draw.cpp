@@ -991,6 +991,8 @@ struct UniformCache {
 #endif
 };
 static UniformCache g_vertexUniformCache;
+// The constants_id of the plan whose constants g_vertexUniformCache holds the bytes of (0: none).
+static uint64_t g_pushedConstantsId = 0;
 static UniformCache g_interpUniformCache;
 static UniformCache g_pixelUniformCache;
 
@@ -1718,8 +1720,15 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // in-between frame's pool and its block): most draws repeat the constants of
   // the draw before them, 96 percent of the Forsaken Fortress's 17,500 a frame,
   // and each comparison of equal blocks reads all 2.8 KB of both.
-  const bool repeatsLast = repeats_cached(g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants),
-                                          sizeof(plan.constants));
+  // A plan whose constants were kept from the draw before (constants_id, set
+  // by GxCoreState::build_draw_plan_into) is known to repeat the block last
+  // pushed in this frame packet without comparing them; constants made anew
+  // are compared (they may still be the same bytes).
+  const uint64_t frameId = current_frame_id();
+  const bool repeatsLast =
+      (plan.constants_id != 0 && frameId != 0 && plan.constants_id == g_pushedConstantsId &&
+       g_vertexUniformCache.frameId == frameId && g_vertexUniformCache.range.size == sizeof(plan.constants)) ||
+      repeats_cached(g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants), sizeof(plan.constants));
   // In-between frames: matched on the helper thread (queued below), or here
   // while a traced frame reports each draw's outcome. Here it is matched
   // before a staging segment can split the frame; a split frame is not
@@ -1777,6 +1786,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   const auto uniformRange = push_uniform_dedup(
       g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants),
       sizeof(plan.constants), repeatsLast ? 1 : 0);
+  g_pushedConstantsId = plan.constants_id;
   Range pixelUniformRange{};
   bool pixelRepeats = false;
   if (tev) {

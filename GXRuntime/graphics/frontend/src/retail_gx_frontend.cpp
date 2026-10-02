@@ -261,10 +261,13 @@ void capture_post_tex(PostTexMatrices& post, std::uint32_t base,
                       std::uint32_t count, const std::uint8_t* data_be) {
   const std::span<const std::uint8_t> data(data_be, count * 4u);
   const std::uint32_t last = base + count - 1u;
-  if (base <= kXfDualTex && last >= kXfDualTex)
+  if (base <= kXfDualTex && last >= kXfDualTex) {
     post.off = (read_be32(data, (kXfDualTex - base) * 4u) & 1u) == 0u;
+    dol_gx_recomp_bump_xf_version();
+  }
   if (last < kXfPostMatrixBase || base >= kXfPostMatrixEnd)
     return;
+  dol_gx_recomp_bump_xf_version();
   const std::uint32_t first = base > kXfPostMatrixBase ? base : kXfPostMatrixBase;
   const std::uint32_t end = last < kXfPostMatrixEnd - 1u ? last : kXfPostMatrixEnd - 1u;
   for (std::uint32_t address = first; address <= end; ++address) {
@@ -344,6 +347,7 @@ void snapshot_transform_into(DrawTransformSnapshot& out,
                              const DolGxRecompVertexLayout& layout,
                              std::span<const std::uint8_t> vertex_data,
                              std::uint16_t vertex_count) {
+  out.xf_version = dol_gx_recomp_xf_version();
   out.transform_flags = 0u;
   out.position_matrix_valid_mask = 0u;
   std::memset(out.viewport, 0, sizeof(out.viewport));
@@ -483,6 +487,7 @@ bool RetailGxFrontend::load_state(const std::uint8_t* data, std::size_t size) {
   const std::uint8_t* at = data + sizeof header;
   std::memcpy(&state_, at, sizeof(DolGxRecompState));
   at += sizeof(DolGxRecompState);
+  dol_gx_recomp_bump_xf_version(); // all of it may have changed
   state_.resolver = resolver;
   state_.fifo.size = 0u;
   state_.trace_count = 0u;
@@ -1236,6 +1241,7 @@ bool RetailGxFrontend::emit_new_packets(AuroraRenderSink& sink,
         draw_transform_head_ < draw_queue_count_) {
       const DrawTransformSnapshot& transform =
           draw_transform_queue_[draw_transform_head_++];
+      packet.draw.xf_version = transform.xf_version;
       packet.draw.transform_flags = transform.transform_flags;
       packet.draw.current_pn_matrix = transform.current_pn_matrix;
       packet.draw.payload_pn_matrix_mask =

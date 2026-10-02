@@ -16,6 +16,8 @@ extern "C" {
 namespace gxruntime::aurora_recomp {
 
 struct DrawTransformSnapshot {
+  // dol_gx_recomp_xf_version() at the draw: the same number, the same state.
+  std::uint64_t xf_version = 0;
   std::uint32_t transform_flags = 0;
   std::uint32_t current_pn_matrix = 0;
   std::uint32_t payload_pn_matrix_mask = 0;

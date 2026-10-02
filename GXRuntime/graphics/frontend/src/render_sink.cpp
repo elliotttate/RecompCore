@@ -231,6 +231,7 @@ bool ConsumingAuroraRenderSink::submit_packet(const RenderPacket& packet) {
     draw.texture = bound_texture_;
     for (std::uint32_t t = 0; t < ConsumedDraw::kMaxTexmaps; ++t)
       draw.textures[t] = bound_textures_[t];
+    draw.xf_version = packet.draw.xf_version;
     draw.transform_flags = packet.draw.transform_flags;
     draw.current_pn_matrix = packet.draw.current_pn_matrix;
     draw.payload_pn_matrix_mask = packet.draw.payload_pn_matrix_mask;

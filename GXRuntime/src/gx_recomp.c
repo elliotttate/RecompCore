@@ -55,9 +55,20 @@ static u32 bp_get(u32 value, u32 size, u32 shift) {
     return (value >> shift) & ((1u << size) - 1u);
 }
 
+static u64 g_xf_version = 1u;
+
+u64 dol_gx_recomp_xf_version(void) {
+    return __atomic_load_n(&g_xf_version, __ATOMIC_RELAXED);
+}
+
+void dol_gx_recomp_bump_xf_version(void) {
+    __atomic_add_fetch(&g_xf_version, 1u, __ATOMIC_RELAXED);
+}
+
 static void note_matrix_index_a(DolGxRecompState* gx, u32 value) {
     if (gx == NULL)
         return;
+    dol_gx_recomp_bump_xf_version();
     gx->matrix_index_a = value;
     gx->current_pn_matrix = bp_get(value, 6u, 0u) / 3u;
     if (gx->current_pn_matrix >= DOL_GX_RECOMP_POSITION_MATRIX_COUNT)
@@ -470,6 +481,7 @@ void dol_gx_recomp_init(DolGxRecompState* gx,
     if (gx == NULL)
         return;
     memset(gx, 0, sizeof(*gx));
+    dol_gx_recomp_bump_xf_version();
     gx->bp_regs[DOL_GX_BP_REG_MASK] = 0x00FFFFFFu;
     gx->bp_valid[DOL_GX_BP_REG_MASK] = true;
     if (resolver != NULL)
@@ -955,6 +967,7 @@ bool dol_gx_recomp_capture_xf_transform(DolGxRecompState* gx, u16 base, u8 count
     if (!touches_pn && !touches_tex && !touches_scalar && !touches_window &&
         !touches_light && !touches_normal)
         return false;
+    dol_gx_recomp_bump_xf_version();
     bool captured = false;
     for (u32 w = 0u; w < count; ++w) {
         const u32 xf_addr = (u32)base + w;

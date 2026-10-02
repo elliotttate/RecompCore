@@ -112,6 +112,10 @@ struct RenderDrawPacket {
   // null in pure-state replays that don't carry the draw bytes.
   const std::uint8_t* vertex_payload = nullptr;
   std::uint32_t vertex_payload_size = 0;
+  // dol_gx_recomp_xf_version() when the transform state below was snapshotted
+  // (0: unknown, as in a replay): two draws with the same nonzero number had
+  // the same transform state.
+  std::uint64_t xf_version = 0;
   // Transform state snapshotted at draw time. Projection/viewport validity is
   // in transform_flags; position_matrix_valid_mask has one bit per PN matrix.
   // current_pn_matrix is the Aurora uniform fallback when PNMTXIDX is absent;
@@ -260,6 +264,7 @@ struct ConsumedDraw {
   // per-vertex indices), retained from the Draw packet so an issuing sink can
   // assemble vertices after submit. Empty when the packet carried no payload.
   std::vector<std::uint8_t> vertex_payload;
+  std::uint64_t xf_version = 0; // as in RenderDrawPacket
   std::uint32_t transform_flags = 0;
   std::uint32_t current_pn_matrix = 0;
   std::uint32_t payload_pn_matrix_mask = 0;
