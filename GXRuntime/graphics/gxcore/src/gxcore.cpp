@@ -458,22 +458,36 @@ std::uint32_t read_be(const std::uint8_t* p, std::uint32_t size) {
   return v;
 }
 
-float decode_component(const std::uint8_t* p, std::uint32_t format,
-                       std::uint32_t frac) {
+std::uint16_t load_be16(const std::uint8_t* p) {
+  std::uint16_t v;
+  std::memcpy(&v, p, sizeof v);
+  return __builtin_bswap16(v);
+}
+
+std::uint32_t load_be32(const std::uint8_t* p) {
+  std::uint32_t v;
+  std::memcpy(&v, p, sizeof v);
+  return __builtin_bswap32(v);
+}
+
+// One component of an attribute: fixed-point formats times the entry's
+// 1 / 2^frac, which is exactly dividing by 2^frac as this did (both are the
+// one rounding of the same real number, and an 8- or 16-bit value over 2^31
+// at most is far from the subnormals).
+inline float decode_scaled(const std::uint8_t* p, std::uint32_t format,
+                           float scale) {
   switch (format) {
   case 0u: // u8
-    return static_cast<float>(p[0]) / static_cast<float>(1u << frac);
+    return static_cast<float>(p[0]) * scale;
   case 1u: // s8
-    return static_cast<float>(static_cast<std::int8_t>(p[0])) /
-           static_cast<float>(1u << frac);
+    return static_cast<float>(static_cast<std::int8_t>(p[0])) * scale;
   case 2u: // u16
-    return static_cast<float>(read_be(p, 2)) / static_cast<float>(1u << frac);
-  case 3u: { // s16
-    const auto raw = static_cast<std::int16_t>(read_be(p, 2));
-    return static_cast<float>(raw) / static_cast<float>(1u << frac);
-  }
+    return static_cast<float>(load_be16(p)) * scale;
+  case 3u: // s16
+    return static_cast<float>(static_cast<std::int16_t>(load_be16(p))) *
+           scale;
   case 4u: { // f32 big-endian
-    const std::uint32_t v = read_be(p, 4);
+    const std::uint32_t v = load_be32(p);
     float f;
     std::memcpy(&f, &v, sizeof f);
     return f;
@@ -536,10 +550,17 @@ void decode_color(const std::uint8_t* p, std::uint32_t format, float out[4]) {
     a = p[3];
     break;
   }
-  out[0] = static_cast<float>(r) / 255.f;
-  out[1] = static_cast<float>(g) / 255.f;
-  out[2] = static_cast<float>(b) / 255.f;
-  out[3] = static_cast<float>(a) / 255.f;
+  // The 256 quotients x / 255 once, rather than four divisions a colour.
+  static const auto unorm8 = [] {
+    std::array<float, 256> table{};
+    for (std::uint32_t i = 0; i < 256u; ++i)
+      table[i] = static_cast<float>(i) / 255.f;
+    return table;
+  }();
+  out[0] = unorm8[r];
+  out[1] = unorm8[g];
+  out[2] = unorm8[b];
+  out[3] = unorm8[a];
 }
 
 const ar::ConsumedArrayInput* find_array(const ar::ConsumedDraw& draw,
@@ -1280,6 +1301,18 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
       static_cast<std::size_t>(draw.vertex_count) * kVertexFloats, 0.f);
   const std::uint8_t* payload = draw.vertex_payload.data();
   const std::size_t payload_size = draw.vertex_payload.size();
+  // Each indexed entry's array, found once for the draw (it was looked up
+  // for every element of every vertex), and each entry's component scale.
+  // Whether it is usable is still decided where the first vertex reaches
+  // it, as before.
+  const ar::ConsumedArrayInput* entry_arrays[24] = {};
+  float entry_scales[24];
+  for (std::uint32_t e = 0; e < walk.entry_count; ++e) {
+    const WalkEntry& entry = walk.entries[e];
+    if (entry.vcd_type > 1u)
+      entry_arrays[e] = find_array(draw, entry.attr);
+    entry_scales[e] = 1.f / static_cast<float>(1u << entry.frac);
+  }
   for (std::uint32_t v = 0; v < draw.vertex_count; ++v) {
     float* out_vertex = plan.vertices.data() +
                         static_cast<std::size_t>(v) * kVertexFloats;
@@ -1328,9 +1361,9 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
         advance = entry.element_size;
       } else {
         const std::uint32_t idx_size = entry.vcd_type == 2u ? 1u : 2u;
-        const std::uint32_t index = read_be(p, idx_size);
+        const std::uint32_t index = idx_size == 1u ? p[0] : load_be16(p);
         advance = idx_size;
-        const ar::ConsumedArrayInput* array = find_array(draw, entry.attr);
+        const ar::ConsumedArrayInput* array = entry_arrays[e];
         if (array == nullptr || !array->resolved ||
             array->host_data == nullptr) {
           ++counters.vertex_decode_failures;
@@ -1354,9 +1387,9 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
       case WalkEntry::kPos: {
         std::uint32_t scalar = 0;
         component_scalar_size(entry.format, &scalar);
+        const float scale = entry_scales[e];
         for (std::uint32_t c = 0; c < entry.count && c < 3u; ++c)
-          out_vertex[c] =
-              decode_component(element + c * scalar, entry.format, entry.frac);
+          out_vertex[c] = decode_scaled(element + c * scalar, entry.format, scale);
         if (entry.count == 2u)
           out_vertex[2] = 0.f;
         break;
@@ -1374,10 +1407,10 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
           std::uint32_t scalar = 0;
           component_scalar_size(entry.format, &scalar);
           float* dst = out_vertex + 12u + 2u * entry.out_slot;
-          dst[0] = decode_component(element, entry.format, entry.frac);
+          const float scale = entry_scales[e];
+          dst[0] = decode_scaled(element, entry.format, scale);
           dst[1] = entry.count == 2u
-                       ? decode_component(element + scalar, entry.format,
-                                          entry.frac)
+                       ? decode_scaled(element + scalar, entry.format, scale)
                        : 0.f;
         }
         break;
@@ -1388,10 +1421,11 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
         // arrives as three count==3 entries routed by normal_part.
         std::uint32_t scalar = 0;
         component_scalar_size(entry.format, &scalar);
+        const float scale = entry_scales[e];
         auto decode3 = [&](const std::uint8_t* src, std::uint32_t dst_off) {
           float* dst = out_vertex + dst_off / 4u;
           for (std::uint32_t c = 0; c < 3u; ++c)
-            dst[c] = decode_component(src + c * scalar, entry.format, entry.frac);
+            dst[c] = decode_scaled(src + c * scalar, entry.format, scale);
         };
         if (entry.count >= 9u) {
           decode3(element, kVertexNormalOffset);
