@@ -54,10 +54,14 @@ struct Pacing {
   int calmNeeded = 0;
   uint32_t recent = 0; // one bit a game frame, newest lowest: an overload reported
   // The game's own speed (slow_game): when the last game frame ended here,
-  // and the running average of the gaps between them.
+  // the gaps between the last 60 (a ring), and the last two checks' medians.
   std::chrono::steady_clock::time_point lastEnd{};
-  double gapMs = 0.0;
-  int gaps = 0;
+  std::array<float, 60> gapRing{};
+  int gaps = 0;      // gaps in the ring, up to its size
+  int gapNext = 0;   // where the next gap goes
+  int sinceCheck = 0;
+  int slowChecks = 0; // consecutive checks whose median was slow
+  double gapMs = 0.0; // the latest check's median
 } g_pacing;
 std::atomic_bool g_encodingInterpolated{false};
 std::atomic<uint64_t> g_gameFrame{1};
@@ -1815,30 +1819,42 @@ void note_overload(const char* why) noexcept {
   g_overloaded.store(true, std::memory_order_relaxed);
 }
 
-// The game itself below full speed: its frames ended here more than
-// kSlowGapMs apart on average over the last 8 or so (under 28.2 a second
-// against the game's 29.97). On a CPU with few cores the in-between frames'
-// work (each draw captured here and matched on the helper thread, the
-// render worker drawing them again) takes cores the game's own thread
-// needs, and the game ran in slow motion: 24-27 game frames a second on 4
-// of the i9's E-cores at 60 FPS, 30 with frame interpolation off. A gap of
-// a quarter second or more (a load, a pause, a hidden window) is not the
-// game's speed and starts the average again.
+// The game itself below full speed: the median gap between its last 60
+// frames (2 s) over kSlowGapMs (under 28.2 a second against the game's
+// 29.97) at two checks in a row, a second apart. On a CPU with few cores the
+// in-between frames' work (each draw captured here and matched on the
+// helper thread, the render worker drawing them again) takes cores the
+// game's own thread needs, and the game ran in slow motion: 24-27 game
+// frames a second on 4 of the i9's E-cores at 60 FPS, 30 with frame
+// interpolation off. A gap of 150 ms or more (a pipeline compiled, a file
+// loaded) is a hitch, not the game's speed, and is left out; the median and
+// the second check keep one hitch, or a burst of a few, from reading as slow
+// (an average of the last 8 gaps did: one 150 ms hitch held it over the
+// limit for 13 frames and dropped the in-between frames for at least 3 s).
+// The way DeepSea's frame60 governor judges speed (mod.c, 2026-09).
 static bool slow_game(Pacing& p) {
   static constexpr double kSlowGapMs = 35.5;
+  static constexpr double kHitchMs = 150.0;
+  static constexpr int kCheckEvery = 30;
   const auto now = std::chrono::steady_clock::now();
   const auto last = p.lastEnd;
   p.lastEnd = now;
   if (last == std::chrono::steady_clock::time_point{})
     return false;
   const double ms = std::chrono::duration<double, std::milli>(now - last).count();
-  if (ms >= 250.0) {
-    p.gaps = 0;
-    return false;
+  if (ms < kHitchMs) {
+    p.gapRing[static_cast<size_t>(p.gapNext)] = static_cast<float>(ms);
+    p.gapNext = (p.gapNext + 1) % static_cast<int>(p.gapRing.size());
+    p.gaps = std::min(p.gaps + 1, static_cast<int>(p.gapRing.size()));
   }
-  p.gapMs = p.gaps == 0 ? ms : p.gapMs + (ms - p.gapMs) / 8.0;
-  p.gaps = std::min(p.gaps + 1, 8);
-  return p.gaps >= 8 && p.gapMs > kSlowGapMs;
+  if (++p.sinceCheck >= kCheckEvery && p.gaps == static_cast<int>(p.gapRing.size())) {
+    p.sinceCheck = 0;
+    std::array<float, 60> sorted = p.gapRing;
+    std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 2, sorted.end());
+    p.gapMs = sorted[sorted.size() / 2];
+    p.slowChecks = p.gapMs > kSlowGapMs ? p.slowChecks + 1 : 0;
+  }
+  return p.slowChecks >= 2;
 }
 
 // Recording thread, between game frames: the next frame's in-between frames.
@@ -1894,7 +1910,10 @@ static void pace_steps() {
                      "[interp-pace] in-between frames %d -> %d (the game ran below full speed, %.1f game "
                      "frames a second; back after %.0f s calm)\n",
                      before, p.budget, 1000.0 / p.gapMs, p.calmNeeded / 30.0);
-        p.gaps = 0; // the next drop on new frames' gaps
+        // The next drop on new frames' gaps.
+        p.gaps = 0;
+        p.sinceCheck = 0;
+        p.slowChecks = 0;
       } else {
         std::fprintf(stderr, "[interp-pace] in-between frames %d -> %d (%s; back after %.0f s calm)\n", before,
                      p.budget, why != nullptr ? why : "rendering fell behind", p.calmNeeded / 30.0);
