@@ -337,6 +337,7 @@ constexpr int kInterpMaxSteps = 7;
 struct InterpRanges {
   Range uniform[kInterpMaxSteps];
   Range verts[kInterpMaxSteps];
+  Range pixel[kInterpMaxSteps]; // a TEV draw's pixel constants with blended colours
 };
 void resolve_interp_job(size_t slot, const InterpRanges& ranges);
 // One draw of a batch (gxcore_draw.cpp): its indices' count, and its first

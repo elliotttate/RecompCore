@@ -886,6 +886,52 @@ int main() {
     CHECK(fi::blended_positions() == nullptr);
   }
 
+  // Colours: a TEV draw's colour and konst registers and its fog colour, and
+  // the material and light colours, halfway between the two frames' (a fade,
+  // a particle's colour over its life). The rest of the pixel constants and
+  // the alpha-test references stay this frame's.
+  {
+    fi::end_game_frame();
+    fi::end_game_frame();
+    gxc::PixelShaderConstants before{};
+    before.kcolors[0][0] = 0;
+    before.kcolors[0][3] = 255;
+    before.colors[1][0] = -100;
+    before.fogcolor[2] = 10;
+    before.alpha_ref[0] = 4;
+    gxc::PixelShaderConstants after = before;
+    after.kcolors[0][0] = 200;
+    after.kcolors[0][3] = 0;
+    after.colors[1][0] = 101;
+    after.fogcolor[2] = 30;
+    after.alpha_ref[0] = 90;
+    auto lit = draw_at(0, 0, -500);
+    lit.materials[2][3] = 255;
+    lit.lights[0].color[1] = 40;
+    fi::DrawInput input;
+    input.key = 4242;
+    fi::blend_draw(input, lit, false, &before);
+    CHECK(fi::blended_pixel(0) == nullptr); // no previous frame for it
+    fi::end_game_frame();
+    auto faded = lit;
+    faded.materials[2][3] = 0;
+    faded.lights[0].color[1] = 80;
+    const auto* block = fi::blend_draw(input, faded, false, &after);
+    const auto* pixel = fi::blended_pixel(0);
+    CHECK(pixel != nullptr);
+    if (pixel != nullptr) {
+      CHECK(pixel->kcolors[0][0] == 100 && pixel->kcolors[0][3] == 128);
+      CHECK(pixel->colors[1][0] == 1); // round(-100 + 201 / 2)
+      CHECK(pixel->fogcolor[2] == 20);
+      CHECK(pixel->alpha_ref[0] == 90);
+    }
+    CHECK(block != nullptr && block->materials[2][3] == 128 && block->lights[0].color[1] == 60);
+    // The same colours the next frame: nothing to blend.
+    fi::end_game_frame();
+    fi::blend_draw(input, faded, false, &after);
+    CHECK(fi::blended_pixel(0) == nullptr);
+  }
+
   // 120 Hz: three in-between frames at a quarter, half and three quarters of
   // the way. A draw moving at 40 units a frame is at 10, 20 and 30; a turn of
   // the camera by 24 degrees puts what stands still at 6, 12 and 18 degrees

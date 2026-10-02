@@ -85,17 +85,21 @@ struct Record {
   uint32_t positions;
   uint32_t positionCount;
   uint32_t age;
+  // A TEV draw's pixel constants in FrameRecords::pixels (kNoSamples: none).
+  uint32_t pixel = kNoSamples;
 };
 struct FrameRecords {
   std::vector<gxc::VertexShaderConstants> pool;
   std::vector<Record> records;
   std::vector<VertexSamples> samples;
   std::vector<float> positions; // x, y, z per vertex
+  std::vector<gxc::PixelShaderConstants> pixels; // a run of identical ones once
   void clear() {
     pool.clear();
     records.clear();
     samples.clear();
     positions.clear();
+    pixels.clear();
   }
 };
 
@@ -104,6 +108,9 @@ constexpr uint32_t kMaxBlendedVertices = 1024;
 // blend_draw()'s in-between positions for its draw (x, y, z per vertex), per step.
 std::vector<float> g_blendedPositions[kMaxSteps];
 bool g_haveBlendedPositions = false;
+// And its pixel constants with their colours blended, per step.
+gxc::PixelShaderConstants g_blendedPixel[kMaxSteps];
+bool g_haveBlendedPixel = false;
 
 FrameRecords g_frames[2];
 unsigned g_current = 0;
@@ -883,6 +890,13 @@ inline void blend_linear(const A from[][4], const B to[][4], double t, O out[][4
     blend_turn(from, to, t, out);
 }
 
+// An integer RGBA colour (0-255, or a TEV register's -1024..1023) the step's
+// way from `from` to `to`, rounded to the nearest.
+inline void lerp_colour(std::int32_t out[4], const std::int32_t from[4], const std::int32_t to[4], double t) {
+  for (int c = 0; c < 4; ++c)
+    out[c] = static_cast<std::int32_t>(std::lround(from[c] + (to[c] - from[c]) * t));
+}
+
 inline void lerp_rows(float out[][4], const float from[][4], const float to[][4], int rows, float t) {
   for (int r = 0; r < rows; ++r)
     for (int c = 0; c < 4; ++c)
@@ -1087,6 +1101,12 @@ void blend(const gxc::VertexShaderConstants& previous, const gxc::VertexShaderCo
       out.lights[l].dir[c] = previous.lights[l].dir[c] + (current.lights[l].dir[c] - previous.lights[l].dir[c]) * t;
     }
   }
+  // Colours: the lights', and the material and ambient registers (a model
+  // fading in or out, flashing when hit, the day's light changing).
+  for (int l = 0; l < 8; ++l)
+    lerp_colour(out.lights[l].color, previous.lights[l].color, current.lights[l].color, t);
+  for (int m = 0; m < 4; ++m)
+    lerp_colour(out.materials[m], previous.materials[m], current.materials[m], t);
 }
 
 // The in-between frame when the camera's motion is known: each matrix is the
@@ -1749,9 +1769,40 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
   return &g_blended[0];
 }
 
+// A TEV draw's colours (blend_draw()): kept with its record, and blended
+// with its counterpart's when it has one and they differ.
+static void blend_pixel(const gxc::PixelShaderConstants& pixel, size_t recorded) {
+  FrameRecords& frame = g_frames[g_current];
+  if (frame.records.size() == recorded)
+    return;
+  if (frame.pixels.empty() || std::memcmp(&frame.pixels.back(), &pixel, sizeof(pixel)) != 0)
+    frame.pixels.push_back(pixel);
+  frame.records.back().pixel = static_cast<uint32_t>(frame.pixels.size() - 1);
+  const Record* before = g_match.record;
+  if (before == nullptr || before->pixel == kNoSamples)
+    return;
+  const gxc::PixelShaderConstants& then = g_frames[g_current ^ 1u].pixels[before->pixel];
+  if (std::memcmp(then.colors, pixel.colors, sizeof(pixel.colors)) == 0 &&
+      std::memcmp(then.kcolors, pixel.kcolors, sizeof(pixel.kcolors)) == 0 &&
+      std::memcmp(then.fogcolor, pixel.fogcolor, sizeof(pixel.fogcolor)) == 0)
+    return;
+  for (int step = 0; step < g_frameSteps; ++step) {
+    gxc::PixelShaderConstants& out = g_blendedPixel[step];
+    std::memcpy(&out, &pixel, sizeof(out));
+    const double t = step_weight(step);
+    for (int r = 0; r < 4; ++r) {
+      lerp_colour(out.colors[r], then.colors[r], pixel.colors[r], t);
+      lerp_colour(out.kcolors[r], then.kcolors[r], pixel.kcolors[r], t);
+    }
+    lerp_colour(out.fogcolor, then.fogcolor, pixel.fogcolor, t);
+  }
+  g_haveBlendedPixel = true;
+}
+
 const gxc::VertexShaderConstants* blend_draw(const DrawInput& input, const gxc::VertexShaderConstants& current,
-                                             bool repeatsLastDraw) {
+                                             bool repeatsLastDraw, const gxc::PixelShaderConstants* pixel) {
   g_haveBlendedPositions = false;
+  g_haveBlendedPixel = false;
   g_match = {};
   const bool havePositions = !input.positions.empty();
   const uint32_t count = static_cast<uint32_t>(input.positions.size() / 3u);
@@ -1763,6 +1814,8 @@ const gxc::VertexShaderConstants* blend_draw(const DrawInput& input, const gxc::
                                                         input.haveSamples ? &input.samples : nullptr);
   g_currentTagged = false;
   g_currentAge = 0;
+  if (pixel != nullptr)
+    blend_pixel(*pixel, recorded);
   // A particle's positions: kept for the next frame, and blended when the
   // draw was matched (in 3D or 2D, with one matrix).
   if (!havePositions || frame.records.size() == recorded || input.usedMatrixRows != 0)
@@ -1806,6 +1859,10 @@ const gxc::VertexShaderConstants* blend_draw(uint64_t key, uint64_t usedMatrixRo
 
 const float* blended_positions(int step) noexcept {
   return g_haveBlendedPositions && step < g_frameSteps ? g_blendedPositions[step].data() : nullptr;
+}
+
+const gxc::PixelShaderConstants* blended_pixel(int step) noexcept {
+  return g_haveBlendedPixel && step < g_frameSteps ? &g_blendedPixel[step] : nullptr;
 }
 
 const gxc::VertexShaderConstants* blended_step(int step) noexcept {

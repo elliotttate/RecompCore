@@ -681,6 +681,7 @@ namespace {
 struct DrawPart {
   Range uniform;
   Range verts;
+  Range pixel;
   uint32_t firstIndex;
   uint32_t indexCount;
   uint32_t firstVertex;
@@ -708,14 +709,15 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   // traced frame's own, matched while recording, are one step's).
   const bool interpolated = frame_interp::encoding_interpolated();
   const int step = interpolated ? interp_replay_step() : 0;
-  const auto job_ranges = [&](uint32_t job, Range& uniform, Range& verts) {
-    uniform = verts = {};
+  const auto job_ranges = [&](uint32_t job, Range& uniform, Range& verts, Range& pixel) {
+    uniform = verts = pixel = {};
     if (!interpolated)
       return;
     if (data.interpJob != UINT32_MAX) {
       const InterpRanges& ranges = interp_job_ranges(job);
       uniform = ranges.uniform[step];
       verts = ranges.verts[step];
+      pixel = ranges.pixel[step];
     } else if (step == 0) {
       uniform = data.interpUniformRange;
       verts = data.interpVertRange;
@@ -727,14 +729,15 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   static std::vector<DrawPart> parts;
   parts.clear();
   DrawPart whole{.firstIndex = firstIndex, .indexCount = data.indexCount, .firstVertex = 0};
-  job_ranges(data.interpJob, whole.uniform, whole.verts);
+  job_ranges(data.interpJob, whole.uniform, whole.verts, whole.pixel);
   bool asOne = true;
   if (interpolated && data.batchSize > 1 && data.interpJob != UINT32_MAX) {
     for (uint32_t i = 1; i < data.batchSize && asOne; ++i) {
-      Range uniform, verts;
-      job_ranges(data.interpJob + i, uniform, verts);
+      Range uniform, verts, pixel;
+      job_ranges(data.interpJob + i, uniform, verts, pixel);
       const uint32_t first = batch_draw(data.batch + i).firstVertex;
       asOne = uniform.offset == whole.uniform.offset && uniform.size == whole.uniform.size &&
+              pixel.offset == whole.pixel.offset && pixel.size == whole.pixel.size &&
               (whole.verts.size == 0 ? verts.size == 0
                                      : verts.size != 0 && verts.offset == whole.verts.offset +
                                                                               first * gxc::kVertexStrideBytes);
@@ -745,7 +748,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
         const BatchDraw& part = batch_draw(data.batch + i);
         DrawPart& draw = parts.emplace_back(
             DrawPart{.firstIndex = index, .indexCount = part.indexCount, .firstVertex = part.firstVertex});
-        job_ranges(data.interpJob + i, draw.uniform, draw.verts);
+        job_ranges(data.interpJob + i, draw.uniform, draw.verts, draw.pixel);
         index += part.indexCount;
       }
     }
@@ -795,27 +798,34 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     pass.SetIndexBuffer(g_indexBuffer, wgpu::IndexFormat::Uint16);
     g_pass.indexBound = true;
   }
-  const auto draw = [&] {
+  // group 2 on the TEV path: the PS uniform (a dynamic-uniform bind group at
+  // its own offset), or in an in-between frame its blended colours'.
+  const auto setGroup2 = [&](const DrawPart& part) {
+    const bool blended = part.pixel.size != 0;
+    const auto& psGroup = blended ? g_interpUniformBindGroup : g_uniformBindGroup;
+    const uint32_t psOffset = blended ? part.pixel.offset : data.pixelUniformRange.offset;
+    if (psGroup.Get() != g_pass.group2 || psOffset != g_pass.offset2) {
+      pass.SetBindGroup(2, psGroup, 1, &psOffset);
+      g_pass.group2 = psGroup.Get();
+      g_pass.offset2 = psOffset;
+    }
+  };
+  const auto draw = [&](bool pixel) {
     for (const DrawPart& part : parts) {
       setGroup1(part);
+      if (pixel)
+        setGroup2(part);
       const int32_t baseVertex = setVertices(part);
       pass.DrawIndexed(part.indexCount, 1, part.firstIndex, baseVertex);
     }
   };
   if (data.depthPipeline != 0) {
-    draw();
+    draw(false);
     if (!bind(data.pipeline))
       return;
   }
   if (data.tev) {
-    // group 2 = PS uniform (same dynamic-uniform bind group, its own offset);
-    // group 3 = texture.
-    const uint32_t psOffset = data.pixelUniformRange.offset;
-    if (g_uniformBindGroup.Get() != g_pass.group2 || psOffset != g_pass.offset2) {
-      pass.SetBindGroup(2, g_uniformBindGroup, 1, &psOffset);
-      g_pass.group2 = g_uniformBindGroup.Get();
-      g_pass.offset2 = psOffset;
-    }
+    // group 3 = texture (group 2, the PS uniform, is set for each part).
     if (data.textureBindGroup != 0) {
       const auto& group = find_bind_group(data.textureBindGroup);
       if (group.Get() != g_pass.group3) {
@@ -831,7 +841,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
       g_pass.offset2 = UINT32_MAX;
     }
   }
-  draw();
+  draw(data.tev);
 }
 
 void note_frame_presented() {
@@ -1057,6 +1067,11 @@ struct InterpJob {
   // helper, which keeps the last it was given (InterpHelper::constants).
   bool constantsCopied;
   gxc::VertexShaderConstants constants;
+  // A TEV draw's pixel constants, the same way: copied only where they differ
+  // from those the job before them carried (pixelCopied).
+  bool tev;
+  bool pixelCopied;
+  gxc::PixelShaderConstants pixel;
 };
 
 // A particle's in-between vertices: its own, with the blended positions, in
@@ -1083,15 +1098,19 @@ struct InterpHelper {
   std::mutex mutex;
   std::condition_variable work;
   std::condition_variable idle;
-  // Recording thread: the frame packet being queued and its job count.
+  // Recording thread: the frame packet being queued and its job count, and
+  // whether a job of it has carried pixel constants.
   uint64_t packet = 0;
   uint32_t jobs = 0;
+  bool pixelCarried = false;
   // Helper thread: the last block it staged per step, and a particle's vertices.
   UniformCache cache[frame_interp::kMaxSteps];
+  UniformCache pixelCache[frame_interp::kMaxSteps];
   std::vector<float> vertices;
   // Helper thread: the constants of the last job that carried them, which the
-  // jobs after it that repeat them use.
+  // jobs after it that repeat them use; and the pixel constants likewise.
   gxc::VertexShaderConstants constants;
+  gxc::PixelShaderConstants pixel;
 };
 
 // Made with the thread and never destroyed: the detached thread may still be
@@ -1133,7 +1152,10 @@ void interp_helper_main(InterpHelper* h) {
     const int steps = frame_interp::frame_steps();
     if (job.constantsCopied)
       std::memcpy(&h->constants, &job.constants, sizeof(h->constants));
-    if (frame_interp::blend_draw(job.input, h->constants, job.repeatsLastDraw) != nullptr) {
+    if (job.pixelCopied)
+      std::memcpy(&h->pixel, &job.pixel, sizeof(h->pixel));
+    if (frame_interp::blend_draw(job.input, h->constants, job.repeatsLastDraw, job.tev ? &h->pixel : nullptr) !=
+        nullptr) {
       const bool repeated = frame_interp::last_blend_repeated();
       for (int step = 0; step < steps; ++step)
         ranges.uniform[step] =
@@ -1144,13 +1166,16 @@ void interp_helper_main(InterpHelper* h) {
     for (int step = 0; step < steps; ++step) {
       if (const float* positions = frame_interp::blended_positions(step))
         ranges.verts[step] = push_blended_vertices(job.slot, job.vertices, positions, h->vertices);
+      if (const gxc::PixelShaderConstants* pixel = frame_interp::blended_pixel(step))
+        ranges.pixel[step] = push_interp_uniform_dedup(h->pixelCache[step], job.frameId, job.slot,
+                                                       reinterpret_cast<const uint8_t*>(pixel), sizeof(*pixel), false);
     }
     resolve_interp_job(job.slot, ranges);
     h->consumed.store(tail + 1, std::memory_order_release);
   }
 }
 
-uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw) {
+uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw, bool tev, bool pixelRepeats) {
   InterpHelper* h = g_interpHelper.load(std::memory_order_acquire);
   if (h == nullptr) {
     h = new InterpHelper;
@@ -1161,6 +1186,7 @@ uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw) {
   if (h->packet != frameId) {
     h->packet = frameId;
     h->jobs = 0;
+    h->pixelCarried = false;
   }
   const uint64_t head = h->produced.load(std::memory_order_relaxed);
   while (head - h->consumed.load(std::memory_order_acquire) >= InterpHelper::Capacity)
@@ -1181,6 +1207,14 @@ uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw) {
   job.constantsCopied = !repeatsLastDraw || h->jobs == 0u;
   if (job.constantsCopied)
     std::memcpy(&job.constants, &plan.constants, sizeof(plan.constants));
+  // pixelRepeats: the pixel constants are those last pushed in this frame
+  // packet, which the last TEV job before this one carried (or repeated).
+  job.tev = tev;
+  job.pixelCopied = tev && (!pixelRepeats || !h->pixelCarried);
+  if (job.pixelCopied) {
+    std::memcpy(&job.pixel, &plan.pixel_constants, sizeof(plan.pixel_constants));
+    h->pixelCarried = true;
+  }
   h->produced.store(head + 1, std::memory_order_release);
   // Asleep, it consumes nothing, so a sleeping helper has WakeBatch or more
   // waiting before it is woken. Only then is `sleeping` read, after a full
@@ -1744,11 +1778,14 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants),
       sizeof(plan.constants), repeatsLast ? 1 : 0);
   Range pixelUniformRange{};
+  bool pixelRepeats = false;
   if (tev) {
+    const uint64_t hits = g_pixelUniformCache.hits;
     pixelUniformRange = push_uniform_dedup(
         g_pixelUniformCache,
         reinterpret_cast<const uint8_t*>(&plan.pixel_constants),
         sizeof(plan.pixel_constants));
+    pixelRepeats = g_pixelUniformCache.hits != hits;
   }
   const PipelineConfig colorConfig{
       .version = GXCorePipelineConfigVersion,
@@ -1819,7 +1856,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         g_interpUniformCache, current_frame_id(), recording_frame_slot(), reinterpret_cast<const uint8_t*>(interpConstants),
         sizeof(*interpConstants), frame_interp::last_blend_repeated());
   else if (interpolating && !matchHere)
-    interpJob = queue_interp_job(plan, repeatsLast);
+    interpJob = queue_interp_job(plan, repeatsLast, tev, pixelRepeats);
 
   const auto indexCount = static_cast<uint32_t>(plan.indices.size());
   if (batch != nullptr) {

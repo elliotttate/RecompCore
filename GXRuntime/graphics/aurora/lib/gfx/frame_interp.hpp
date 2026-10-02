@@ -81,10 +81,12 @@ void capture_draw(const gxruntime::gxcore::DrawPlan& plan, DrawInput& out) noexc
 // The pointer is valid until the next call. repeats_last_draw: `current` is
 // the constants of the draw before this one (the caller already compared
 // them), so they are not compared again, and an in-between block made from
-// the same match is reused.
+// the same match is reused. pixel: a TEV draw's pixel constants, whose
+// colours are blended with its counterpart's (blended_pixel()).
 const gxruntime::gxcore::VertexShaderConstants* blend_draw(const DrawInput& input,
                                                            const gxruntime::gxcore::VertexShaderConstants& current,
-                                                           bool repeats_last_draw = false);
+                                                           bool repeats_last_draw = false,
+                                                           const gxruntime::gxcore::PixelShaderConstants* pixel = nullptr);
 // A draw known by its key and rows alone (no samples or positions).
 const gxruntime::gxcore::VertexShaderConstants* blend_draw(
     uint64_t key, uint64_t used_matrix_rows,
@@ -97,6 +99,12 @@ const gxruntime::gxcore::VertexShaderConstants* blended_step(int step) noexcept;
 // trail): after blend_draw(), a step's in-between positions (x, y, z per
 // decoded vertex), valid until the next call, or nullptr when it draws its own.
 const float* blended_positions(int step = 0) noexcept;
+
+// After a blend_draw() given pixel constants: a step's, with the TEV colour
+// and konst registers and the fog colour blended toward the counterpart's
+// (a fade, a particle's colour over its life, a flash), valid until the next
+// call, or nullptr when they are its own (no counterpart, or the same).
+const gxruntime::gxcore::PixelShaderConstants* blended_pixel(int step) noexcept;
 
 // Whether the last blend_draw() returned the same in-between block as the call
 // before it (its bytes unchanged), so the caller need not compare them.
