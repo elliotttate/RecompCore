@@ -1902,17 +1902,21 @@ void GxCoreSink::on_consumed_draw(const ar::ConsumedDraw& draw,
   self->pending_state_.build_draw_plan_into(draw, self->counters_,
                                             &self->cached_attrs_, plan);
   // A draw scope: the next draws with positions of their own, up to its
-  // count, are its emitter's; any other draw ends it.
+  // count, are its emitter's; any other draw ends it. A count with bit 23
+  // set is a cloth's strips, which index their positions.
   const GxCoreState& state = self->pending_state_;
   if (state.bp_valid(GxCoreState::kDrawScopeRegister)) {
+    const std::uint32_t count =
+        state.bp_valid(GxCoreState::kDrawScopeCountRegister)
+            ? state.bp(GxCoreState::kDrawScopeCountRegister)
+            : 0u;
     self->scope_ = state.bp(GxCoreState::kDrawScopeRegister);
-    self->scope_left_ = state.bp_valid(GxCoreState::kDrawScopeCountRegister)
-                            ? state.bp(GxCoreState::kDrawScopeCountRegister)
-                            : 0u;
+    self->scope_left_ = count & 0x7FFFFFu;
+    self->scope_indexed_ = (count & 0x800000u) != 0u;
     self->scope_part_ = 1;
   }
   if (self->scope_left_ != 0u) {
-    if (plan.ok && plan.match_direct_position) {
+    if (plan.ok && (plan.match_direct_position || self->scope_indexed_)) {
       plan.draw_scope = self->scope_;
       plan.draw_scope_part = self->scope_part_++;
       --self->scope_left_;

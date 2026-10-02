@@ -1714,7 +1714,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     std::fprintf(stderr,
                  "[frame-interp-trace] frame=%llu %s key=%016llx prim=0x%02X fmt=%u verts=%u payload=%u idx=%d "
                  "t=(%.1f,%.1f,%.1f) s=%.3f proj00=%.3f proj32=%.1f tex=%08X bt=(%.1f,%.1f,%.1f) bt0=(%.1f,%.1f,%.1f) "
-                 "direct=%d tag=%06X age=%u positions=%d\n",
+                 "direct=%d tag=%06X age=%u scope=%06X:%u positions=%d\n",
                  static_cast<unsigned long long>(frame_interp::game_frame_number()), frame_interp::last_outcome(),
                  static_cast<unsigned long long>(frame_interp::draw_key(plan)),
                  plan.match_primitive, plan.match_vtx_fmt, plan.vertex_count, plan.match_payload_size,
@@ -1727,7 +1727,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                  interpConstants ? interpConstants->transformmatrices[0][3] - plan.constants.transformmatrices[0][3] : 0.f,
                  interpConstants ? interpConstants->transformmatrices[1][3] - plan.constants.transformmatrices[1][3] : 0.f,
                  interpConstants ? interpConstants->transformmatrices[2][3] - plan.constants.transformmatrices[2][3] : 0.f,
-                 plan.match_direct_position ? 1 : 0, plan.draw_tag, plan.draw_tag_age,
+                 plan.match_direct_position ? 1 : 0, plan.draw_tag, plan.draw_tag_age, plan.draw_scope, plan.draw_scope_part,
                  tracedPositions != nullptr ? 1 : 0);
   }
   if (!staging_has_capacity(vertBytes + gxc::kVertexStrideBytes, indexBytes, sizeof(plan.constants),

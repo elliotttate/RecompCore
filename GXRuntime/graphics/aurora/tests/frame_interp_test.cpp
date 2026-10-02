@@ -850,6 +850,42 @@ int main() {
     CHECK(front != nullptr && near(front[2], -30.f) && near(front[3 * 3 + 2], 30.f));
   }
 
+  // A cloth's strips (a scope over draws that index their positions): the
+  // game moves the vertices itself, under a matrix that stays put, so each
+  // vertex is blended halfway, as a particle's are.
+  {
+    fi::end_game_frame();
+    fi::end_game_frame();
+    static const uint8_t payload[24] = {7};
+    const auto strip = [](uint32_t part, float sway) {
+      gxc::DrawPlan plan;
+      plan.match_payload = payload;
+      plan.match_payload_size = sizeof(payload);
+      plan.match_primitive = 0x98;
+      plan.match_direct_position = false; // indexed positions
+      plan.vertex_count = 4;
+      plan.draw_scope = 0x5151;
+      plan.draw_scope_part = part;
+      plan.vertices.assign(4 * gxc::kVertexFloats, 0.f);
+      for (int i = 0; i < 4; ++i) {
+        float* v = plan.vertices.data() + i * gxc::kVertexFloats;
+        v[0] = (i & 1) * 20.f + sway * (i >> 1); // the free edge sways
+        v[1] = (i >> 1) * 30.f;
+      }
+      return plan;
+    };
+    const auto pole = draw_at(0, 0, -300);
+    blend_plan(strip(1, 0.f), pole);
+    blend_plan(strip(2, 0.f), pole);
+    fi::end_game_frame();
+    CHECK(blend_plan(strip(1, 8.f), pole) == nullptr); // the matrix did not move
+    const float* swayed = fi::blended_positions();
+    CHECK(swayed != nullptr && near(swayed[2 * 3], 4.f) && near(swayed[3 * 3], 24.f) && near(swayed[0], 0.f));
+    // The second strip did not move: drawn as it is.
+    blend_plan(strip(2, 0.f), pole);
+    CHECK(fi::blended_positions() == nullptr);
+  }
+
   // 120 Hz: three in-between frames at a quarter, half and three quarters of
   // the way. A draw moving at 40 units a frame is at 10, 20 and 30; a turn of
   // the camera by 24 degrees puts what stands still at 6, 12 and 18 degrees

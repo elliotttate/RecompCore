@@ -225,10 +225,13 @@ private:
   bool replay_overflow_ = false;
   CachedVertexAttrs cached_attrs_{}; // cross-draw N/B/T fallback (stream order)
   DrawPlan scratch_plan_{};          // reused by on_consumed_draw
-  // The draw scope under way: its emitter, the draws left and the next's place.
+  // The draw scope under way: its emitter, the draws left and the next's place,
+  // and whether its draws index their positions (cloth) rather than send them
+  // (a wake's).
   std::uint32_t scope_ = 0;
   std::uint32_t scope_left_ = 0;
   std::uint32_t scope_part_ = 0;
+  bool scope_indexed_ = false;
   PlanObserver plan_observer_ = nullptr;
   void* plan_observer_user_ = nullptr;
   CopyObserver copy_observer_ = nullptr;

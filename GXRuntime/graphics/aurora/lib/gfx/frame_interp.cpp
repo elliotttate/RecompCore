@@ -1272,10 +1272,11 @@ void set_enabled(bool enabled) noexcept { g_enabled.store(enabled, std::memory_o
 static uint64_t draw_key_of(const gxc::DrawPlan& plan) noexcept {
   if (plan.match_payload == nullptr || plan.match_payload_size == 0)
     return 0;
-  if (plan.match_direct_position && plan.draw_scope_part != 0) {
+  if (plan.draw_scope_part != 0) {
     // One of the draws a wake's emitter makes (its fans and strips), by its
     // place among them: its vertices are the wake's particles in order (see
-    // blend_positions()).
+    // blend_positions()). Or one of a cloth's strips: the same vertices of
+    // the cloth every frame.
     const uint64_t h = mix64(0x5C0Au ^ (uint64_t(plan.draw_scope) << 8) ^ (uint64_t(plan.draw_scope_part) << 40));
     return h == 0 ? 1 : h;
   }
@@ -1333,7 +1334,11 @@ void capture_draw(const gxc::DrawPlan& plan, DrawInput& out) noexcept {
   // shadow is cast on the sea's triangles under it, a different list as it
   // moves), and blending one list toward the other drew the shadow torn.
   const size_t decoded = plan.vertices.size() / gxc::kVertexFloats;
-  if (plan.match_direct_position) {
+  // A cloth's strip (a scope over draws that index their positions): the
+  // game moves its vertices each frame, so they are blended one by one, as a
+  // particle's are.
+  const bool cloth = !plan.match_direct_position && plan.draw_scope_part != 0;
+  if (plan.match_direct_position || cloth) {
     if ((plan.draw_tag != 0 || plan.draw_scope_part != 0) && decoded > 0 && decoded <= kMaxBlendedVertices) {
       out.positions.resize(decoded * 3u);
       for (size_t i = 0; i < decoded; ++i)
