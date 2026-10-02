@@ -67,6 +67,7 @@ bool g_bcTexturesSupported = false;
 bool g_astcTexturesSupported = false;
 bool g_textureComponentSwizzleSupported = false;
 bool g_dualSourceBlendingSupported = false;
+bool g_deviceLock = false;
 static std::atomic_bool g_initialized = false;
 
 namespace {
@@ -900,7 +901,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         requiredLimits.maxStorageBuffersPerShaderStage, requiredLimits.minUniformBufferOffsetAlignment,
         requiredLimits.minStorageBufferOffsetAlignment);
     std::vector<wgpu::FeatureName> requiredFeatures;
-    bool deviceLock = false;
+    g_deviceLock = false;
     g_hasCoreFeatures = false;
     g_bcTexturesSupported = false;
     g_astcTexturesSupported = false;
@@ -946,7 +947,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         const char* env = std::getenv("DOL_AURORA_DEVICE_LOCK");
         if (env == nullptr || env[0] != '0') {
           requiredFeatures.push_back(feature);
-          deviceLock = true;
+          g_deviceLock = true;
         }
       }
 #endif
@@ -962,7 +963,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
       featureList += magic_enum::enum_name(featureName);
     }
     Log.info("Enabling features: {}", featureList);
-    Log.info("Device lock (implicit device synchronization): {}", deviceLock ? "on" : "off");
+    Log.info("Device lock (implicit device synchronization): {}", g_deviceLock ? "on" : "off");
 #ifdef WEBGPU_DAWN
     wgpu::DawnCacheDeviceDescriptor cacheDescriptor({
         .isolationKey = nullptr,

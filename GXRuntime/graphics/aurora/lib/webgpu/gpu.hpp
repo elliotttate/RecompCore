@@ -57,6 +57,9 @@ extern bool g_bcTexturesSupported;
 extern bool g_astcTexturesSupported;
 extern bool g_textureComponentSwizzleSupported;
 extern bool g_dualSourceBlendingSupported;
+// Dawn takes its device lock (ImplicitDeviceSynchronization), so it may be
+// called from several threads at once (pipelines compile on several).
+extern bool g_deviceLock;
 
 bool initialize(AuroraBackend backend, bool allowCpu);
 void shutdown();
