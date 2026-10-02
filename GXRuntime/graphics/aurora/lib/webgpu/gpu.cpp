@@ -5,6 +5,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -899,6 +900,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         requiredLimits.maxStorageBuffersPerShaderStage, requiredLimits.minUniformBufferOffsetAlignment,
         requiredLimits.minStorageBufferOffsetAlignment);
     std::vector<wgpu::FeatureName> requiredFeatures;
+    bool deviceLock = false;
     g_hasCoreFeatures = false;
     g_bcTexturesSupported = false;
     g_astcTexturesSupported = false;
@@ -925,6 +927,29 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         }
         requiredFeatures.push_back(feature);
       }
+#ifdef WEBGPU_DAWN
+      // Dawn is called from several threads: the GX worker makes textures,
+      // samplers and bind groups while the render worker records, submits and
+      // frees a frame's (an EFB copy's scaling or conversion makes a bind group
+      // with a sampler every frame), and the main thread presents and frees the
+      // texture cache when a save state loads. Without this feature Dawn takes
+      // no device lock, and its D3D12 backend keeps the sampler descriptors of
+      // every bind group in one plain hash set (SamplerHeapCache) and texture
+      // memory in plain queues (ResourceAllocatorManager). A bind group made on
+      // the GX worker while the render worker freed one read that set mid-
+      // rehash: an access violation at 0x40 in CreateBindGroup, then heap
+      // corruption, once in about ten boots into a save state. With the feature
+      // those calls take the device's lock; encoding, pipeline and shader
+      // compiles and texture views do not. DOL_AURORA_DEVICE_LOCK=0 leaves it
+      // off (diagnosis).
+      if (feature == wgpu::FeatureName::ImplicitDeviceSynchronization) {
+        const char* env = std::getenv("DOL_AURORA_DEVICE_LOCK");
+        if (env == nullptr || env[0] != '0') {
+          requiredFeatures.push_back(feature);
+          deviceLock = true;
+        }
+      }
+#endif
 #ifdef TRACY_ENABLE
       if (feature == wgpu::FeatureName::TimestampQuery) {
         requiredFeatures.push_back(feature);
@@ -937,6 +962,7 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
       featureList += magic_enum::enum_name(featureName);
     }
     Log.info("Enabling features: {}", featureList);
+    Log.info("Device lock (implicit device synchronization): {}", deviceLock ? "on" : "off");
 #ifdef WEBGPU_DAWN
     wgpu::DawnCacheDeviceDescriptor cacheDescriptor({
         .isolationKey = nullptr,
