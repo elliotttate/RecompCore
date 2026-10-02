@@ -259,6 +259,12 @@ bool ConsumingAuroraRenderSink::submit_packet(const RenderPacket& packet) {
                 sizeof(draw.tex_matrix_word_mask));
     std::memcpy(draw.xf_regs, packet.draw.xf_regs, sizeof(draw.xf_regs));
     draw.xf_reg_mask = packet.draw.xf_reg_mask;
+    draw.post_tex_mask = packet.draw.post_tex_mask;
+    draw.post_tex_normalize = packet.draw.post_tex_normalize;
+    for (std::uint32_t i = 0; i < 8u; ++i)
+      if ((draw.post_tex_mask & (1u << i)) != 0u)
+        std::memcpy(draw.post_tex_rows[i], packet.draw.post_tex_rows[i],
+                    sizeof(draw.post_tex_rows[i]));
     back_assembled_ = false; // the just-placed draw is not yet assembled
     // Retain the draw's raw per-vertex bytes (valid only during this call) so an
     // issuing sink can assemble vertices after submit.

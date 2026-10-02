@@ -1560,6 +1560,27 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
       identity_rows(rows);
       ++counters.unresolved_tex_matrix;
     }
+    // Dual-texture post transform (XF 0x1012, on since GXInit): the texture
+    // matrix's result goes through a second matrix from post-transform memory
+    // (Dolphin VertexShaderGen WriteTexCoordTransforms). Without normalization
+    // the two are one 3x4 matrix, folded here so the shader is unchanged:
+    // coord.w is 1, so each post row's w joins the fourth column, and a
+    // two-row (ST) texgen's third coordinate is the constant 1. The lava's
+    // pattern and colour ramp are projected this way (d_magma.cpp).
+    if ((draw.post_tex_mask & (1u << i)) != 0u &&
+        (draw.post_tex_normalize & (1u << i)) == 0u) {
+      const float* p = draw.post_tex_rows[i];
+      const bool stq = key.tex_gens[i].projection != 0u;
+      float folded[3][4];
+      for (std::uint32_t r = 0; r < 3u; ++r) {
+        const float* pr = p + 4u * r;
+        for (std::uint32_t col = 0; col < 4u; ++col)
+          folded[r][col] = pr[0] * rows[0][col] + pr[1] * rows[1][col] +
+                           (stq ? pr[2] * rows[2][col] : 0.f);
+        folded[r][3] += pr[3] + (stq ? 0.f : pr[2]);
+      }
+      std::memcpy(rows, folded, sizeof rows);
+    }
     for (std::uint32_t k = 0; k < 3u; ++k)
       std::memcpy(c.texmatrices[3u * i + k], rows[k], sizeof rows[k]);
     if (i < kMaxTexGens)

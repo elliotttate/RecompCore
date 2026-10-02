@@ -42,6 +42,23 @@ struct DrawTransformSnapshot {
   std::uint16_t tex_matrix_word_mask[DOL_GX_RECOMP_TEX_MATRIX_COUNT]{};
   std::uint32_t xf_regs[DOL_GX_RECOMP_XF_REG_COUNT]{};
   std::uint64_t xf_reg_mask = 0;
+  // Dual-texture post-transform at draw time (see RenderDrawPacket).
+  std::uint8_t post_tex_mask = 0;
+  std::uint8_t post_tex_normalize = 0;
+  float post_tex_rows[8][12]{};
+};
+
+// XF post-transform ("dual texture") matrix memory, 0x500..0x5FF: 64 rows of
+// four floats. Kept beside DolGxRecompState rather than in it, so the saved
+// front-end state keeps its size; after a load the rows read as identity
+// until the game loads them again.
+struct PostTexMatrices {
+  float rows[64][4]{};
+  std::uint64_t written = 0;  // rows the game has loaded
+  // identity[k] bit r: row r is row k of the identity (or was never loaded),
+  // so a texgen whose three post rows all read as identity needs no transform.
+  std::uint64_t identity[3] = {~0ull, ~0ull, ~0ull};
+  bool off = false; // XF 0x1012 written 0; GXInit writes 1
 };
 
 class RetailGxFrontend {
@@ -144,6 +161,7 @@ private:
   bool display_copy_stopped_ = false;
 
   DolGxRecompState state_{};
+  PostTexMatrices post_tex_{};
   std::vector<std::uint8_t> fifo_buffer_;
   // Raw per-vertex payload bytes for each parsed draw, in trace order. Popped in
   // lockstep as Draw events are emitted (emit_new_packets) so each Draw packet

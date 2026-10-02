@@ -780,6 +780,82 @@ void test_fifth_texgen_plan_decode() {
   CHECK((texidx_hi & 0xFFu) == 33u);
 }
 
+// The dual-texture post transform is folded into a regular texgen's matrix
+// rows: post * (texmtx * coord) for a three-row (STQ) texgen, and post *
+// (s, t, 1) for a two-row (ST) one. The lava (d_magma.cpp) uses it.
+void test_post_tex_matrix_fold() {
+  for (const bool stq : {true, false}) {
+    gxc::GxCoreState state;
+    state.reset();
+    state.apply(bp(0x00u, 1u));
+    state.apply({.kind = ar::RenderStateKind::CpVcd,
+                 .index = 0u,
+                 .value = 1u << 9u}); // position direct
+    state.apply({.kind = ar::RenderStateKind::CpVcd, .index = 1u, .value = 0u});
+    state.apply({.kind = ar::RenderStateKind::CpVat,
+                 .index = 0u,
+                 .value = 1u | (4u << 1u),
+                 .aux0 = 0u});
+    state.apply({.kind = ar::RenderStateKind::CpVat, .index = 0u, .value = 0u, .aux0 = 1u});
+    state.apply({.kind = ar::RenderStateKind::CpVat, .index = 0u, .value = 0u, .aux0 = 2u});
+
+    ar::ConsumedDraw draw{};
+    draw.primitive = 0x80u;
+    draw.vertex_count = 4u;
+    draw.vertex_size = 12u;
+    constexpr float vertices[4][3] = {
+        {-1.f, -1.f, 0.f}, {1.f, -1.f, 0.f}, {1.f, 1.f, 0.f}, {-1.f, 1.f, 0.f}};
+    for (const auto& vertex : vertices)
+      for (float value : vertex)
+        append_be_f32(draw.vertex_payload, value);
+    draw.transform_flags = ar::kDrawTransformProjectionValid;
+    draw.projection[0] = 1.f;
+    draw.projection[2] = 1.f;
+    draw.projection[4] = -1.f;
+    draw.projection_type = 1u;
+    draw.position_matrix_valid_mask = 1u;
+    draw.position_matrices[0][0] = 1.f;
+    draw.position_matrices[0][5] = 1.f;
+    draw.position_matrices[0][10] = 1.f;
+
+    draw.xf_regs[0] = 30u << 6u; // texgen 0 from GX_TEXMTX0 (row 30)
+    draw.xf_regs[0x27] = 1u;
+    // Regular, position source (row 0), ABC1; MTX3x4 sets the projection bit.
+    draw.xf_regs[0x28] = (stq ? 1u << 1u : 0u) | (1u << 2u);
+    draw.xf_reg_mask = (1ull << 0u) | (1ull << 0x27u) | (1ull << 0x28u);
+    const float tex[12] = {2.f, 0.f, 0.f, 0.5f, 0.f, 3.f, 0.f, 0.25f,
+                           0.f, 0.f, 4.f, 1.f};
+    std::memcpy(draw.tex_matrices[0], tex, sizeof tex);
+    draw.tex_matrix_word_mask[0] = 0xFFFu;
+    const float post[12] = {0.5f, 0.f, 2.f, 0.125f, 0.f, 0.25f, 0.f, 0.5f,
+                            0.f, 0.f, 1.f, 0.f};
+    draw.post_tex_mask = 1u;
+    std::memcpy(draw.post_tex_rows[0], post, sizeof post);
+
+    gxc::GapCounters gaps;
+    const gxc::DrawPlan plan = state.build_draw_plan(draw, gaps);
+    CHECK(plan.ok);
+    CHECK(plan.pipeline.shader.tex_gens[0].projection == (stq ? 1u : 0u));
+    const float(*m)[4] = plan.constants.texmatrices;
+    // Row 0: 0.5 * tex row 0, plus 2 * tex row 2 (STQ) or 2 * the constant 1
+    // (ST), plus the post row's w.
+    CHECK(m[0][0] == 1.f);
+    CHECK(m[0][2] == (stq ? 8.f : 0.f));
+    CHECK(m[0][3] == (stq ? 0.25f + 2.f + 0.125f : 0.25f + 2.f + 0.125f));
+    CHECK(m[1][1] == 0.75f);
+    CHECK(m[1][3] == 0.0625f + 0.5f);
+    CHECK(m[2][2] == (stq ? 4.f : 0.f));
+    CHECK(m[2][3] == (stq ? 1.f : 1.f));
+
+    // Without the mask bit (the identity post matrix) the rows are the
+    // texture matrix's.
+    draw.post_tex_mask = 0u;
+    const gxc::DrawPlan plain = state.build_draw_plan(draw, gaps);
+    CHECK(plain.constants.texmatrices[0][0] == 2.f);
+    CHECK(plain.constants.texmatrices[0][3] == 0.5f);
+  }
+}
+
 // Item 5: Emboss texgen (Dolphin VertexShaderGen) adds the view-space light dir
 // projected onto tangent/binormal to the emboss-source texgen's coords. Needs
 // the lights uniform + NBT vertex inputs even on an unlit draw.
@@ -1926,6 +2002,7 @@ int main() {
   test_texgen_normal_source();
   test_five_texgens();
   test_fifth_texgen_plan_decode();
+  test_post_tex_matrix_fold();
   test_texgen_emboss();
   test_texgen_per_vertex_mtx();
   test_tev_indirect_matrix();

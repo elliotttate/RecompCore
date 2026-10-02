@@ -142,6 +142,13 @@ struct RenderDrawPacket {
   std::uint16_t tex_matrix_word_mask[DOL_GX_RECOMP_TEX_MATRIX_COUNT]{};
   std::uint32_t xf_regs[DOL_GX_RECOMP_XF_REG_COUNT]{};
   std::uint64_t xf_reg_mask = 0;
+  // Dual-texture post-transform (XF 0x1012 on, post info 0x1050.., matrices
+  // 0x500..0x5FF): bit i of post_tex_mask when texgen i's post matrix is not
+  // the identity or it normalizes first; its three rows are post_tex_rows[i]
+  // (only set bits are written).
+  std::uint8_t post_tex_mask = 0;
+  std::uint8_t post_tex_normalize = 0;
+  float post_tex_rows[8][12]{};
 };
 
 struct RenderPacket {
@@ -275,6 +282,10 @@ struct ConsumedDraw {
   std::uint16_t tex_matrix_word_mask[DOL_GX_RECOMP_TEX_MATRIX_COUNT]{};
   std::uint32_t xf_regs[DOL_GX_RECOMP_XF_REG_COUNT]{};
   std::uint64_t xf_reg_mask = 0;
+  // Dual-texture post-transform, as in RenderDrawPacket.
+  std::uint8_t post_tex_mask = 0;
+  std::uint8_t post_tex_normalize = 0;
+  float post_tex_rows[8][12]{};
 };
 
 using ConsumedDrawObserver = void (*)(const ConsumedDraw& draw,
