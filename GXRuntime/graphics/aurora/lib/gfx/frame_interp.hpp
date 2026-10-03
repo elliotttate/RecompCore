@@ -63,17 +63,28 @@ uint64_t used_matrix_rows(const gxruntime::gxcore::DrawPlan& plan) noexcept;
 // What blend_draw() needs of a draw besides its constants, captured from its
 // plan on the recording thread (the draw may be matched later, on another
 // thread): its key and indexed matrix rows, three of its vertices (for a
-// model the game skins on the CPU; see vertex_motion()), and a tagged
-// particle's positions (x, y, z per decoded vertex) and age.
+// model the game skins on the CPU; see vertex_motion()), and stable indexed
+// meshes' or tagged particles' positions (x, y, z per decoded vertex).
 struct DrawInput {
   uint64_t key = 0;
   uint64_t usedMatrixRows = 0;
   bool haveSamples = false;
   std::array<float, 9> samples{};
   std::vector<float> positions;
+  // Direct UVs of indexed meshes, packed per vertex in mask-bit order.
+  std::vector<float> texcoords;
+  uint8_t texcoordMask = 0;
+  bool tagged = false;
   uint32_t age = 0;
+  // A depth-disabled direct-position 2D sprite: match its transformed bounds
+  // rather than its occurrence among copies of one texture.
+  bool screenSpace = false;
+  std::array<float, 2> screenCenter{};
+  std::array<float, 2> screenExtent{};
 };
 void capture_draw(const gxruntime::gxcore::DrawPlan& plan, DrawInput& out) noexcept;
+// These draws need independent vertex ranges in each in-between frame.
+bool blends_vertices(const gxruntime::gxcore::DrawPlan& plan) noexcept;
 
 // Once per submitted gxcore draw, in draw order, on one thread at a time.
 // Returns the constants the draw uses in the in-between frame, or nullptr
@@ -99,6 +110,10 @@ const gxruntime::gxcore::VertexShaderConstants* blended_step(int step) noexcept;
 // trail): after blend_draw(), a step's in-between positions (x, y, z per
 // decoded vertex), valid until the next call, or nullptr when it draws its own.
 const float* blended_positions(int step = 0) noexcept;
+// A matched indexed mesh's direct UVs, packed in mask-bit order, or nullptr.
+// Their mask and data remain valid until the next blend_draw().
+const float* blended_texcoords(int step = 0) noexcept;
+uint8_t blended_texcoord_mask() noexcept;
 
 // After a blend_draw() given pixel constants: a step's, with the TEV colour
 // and konst registers and the fog colour blended toward the counterpart's

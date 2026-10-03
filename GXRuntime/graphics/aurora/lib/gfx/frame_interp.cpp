@@ -87,6 +87,10 @@ struct Record {
   uint32_t age;
   // A TEV draw's pixel constants in FrameRecords::pixels (kNoSamples: none).
   uint32_t pixel = kNoSamples;
+  uint32_t texcoords = kNoSamples;
+  uint8_t texcoordMask = 0;
+  std::array<float, 2> screenExtent{};
+  bool screenConsumed = false;
 };
 struct FrameRecords {
   std::vector<gxc::VertexShaderConstants> pool;
@@ -94,12 +98,14 @@ struct FrameRecords {
   std::vector<VertexSamples> samples;
   std::vector<float> positions; // x, y, z per vertex
   std::vector<gxc::PixelShaderConstants> pixels; // a run of identical ones once
+  std::vector<float> texcoords;
   void clear() {
     pool.clear();
     records.clear();
     samples.clear();
     positions.clear();
     pixels.clear();
+    texcoords.clear();
   }
 };
 
@@ -111,6 +117,8 @@ bool g_haveBlendedPositions = false;
 // And its pixel constants with their colours blended, per step.
 gxc::PixelShaderConstants g_blendedPixel[kMaxSteps];
 bool g_haveBlendedPixel = false;
+std::vector<float> g_blendedTexcoords[kMaxSteps];
+uint8_t g_blendedTexcoordMask = 0;
 
 FrameRecords g_frames[2];
 unsigned g_current = 0;
@@ -1266,7 +1274,10 @@ bool blend_positions(const float* before, const float* now, uint32_t count, cons
     for (int k = 0; k < 3; ++k) {
       const double q = q0[k] + (q1[k] - q0[k]) * t;
       out[i * 3u + k] = static_cast<float>(q);
-      moves = moves || std::fabs(q - p1[k]) > 1e-3 * (1.0 + std::fabs(p1[k]));
+      // World coordinates can be hundreds of thousands of units: a relative
+      // tolerance of .1% discarded visible wave and model motion there.
+      const double tolerance = tagged ? 1e-3 * (1.0 + std::fabs(p1[k])) : 1e-3 + 2e-7 * std::fabs(p1[k]);
+      moves = moves || std::fabs(q - p1[k]) > tolerance;
     }
   }
   return moves;
@@ -1289,10 +1300,16 @@ void log_counts() {
 bool enabled() noexcept { return g_enabled.load(std::memory_order_relaxed); }
 void set_enabled(bool enabled) noexcept { g_enabled.store(enabled, std::memory_order_relaxed); }
 
+static bool screen_space_sprite(const gxc::DrawPlan& plan) noexcept {
+  return plan.match_direct_position && plan.constants.projection[3][2] == 0.f &&
+         !plan.pipeline.depth_test && !plan.pipeline.depth_update;
+}
+
 static uint64_t draw_key_of(const gxc::DrawPlan& plan) noexcept {
   if (plan.match_payload == nullptr || plan.match_payload_size == 0)
     return 0;
-  if (plan.draw_scope_part != 0) {
+  const bool screenSpace = screen_space_sprite(plan);
+  if (!screenSpace && plan.draw_scope_part != 0) {
     // One of the draws a wake's emitter makes (its fans and strips), by its
     // place among them: its vertices are the wake's particles in order (see
     // blend_positions()). Or one of a cloth's strips: the same vertices of
@@ -1320,8 +1337,43 @@ static uint64_t draw_key_of(const gxc::DrawPlan& plan) noexcept {
     // New positions every frame: the same shape with the same texture, and
     // for a particle the host tagged, that particle (see blend_positions()).
     h = mix64(h ^ 0xD1u ^ (uint64_t(plan.tex_address) << 8) ^ (uint64_t(plan.texmap_mask) << 40));
-    if (plan.draw_tag != 0)
+    if (screenSpace) {
+      // Keep atlas regions and vertex RGB tints (not fade alpha) distinct.
+      // Position and scale may animate, so those are compared as bounds by
+      // match_draw(). A particle tag left in GX state is not a UI identity.
+      h = mix64(h ^ 0x53435245454Eull);
+      const size_t decoded = plan.vertices.size() / gxc::kVertexFloats;
+      if (decoded == 0 || decoded > kMaxBlendedVertices)
+        return 0;
+      for (size_t v = 0; v < decoded; ++v) {
+        const float* vertex = plan.vertices.data() + v * gxc::kVertexFloats;
+        for (unsigned uv = 0; uv < plan.pipeline.shader.num_tex_gens && uv < gxc::kMaxTexGens; ++uv)
+          for (unsigned st = 0; st < 2; ++st)
+            h = mix64(h ^ std::bit_cast<uint32_t>(vertex[gxc::kVertexUvOffset / sizeof(float) + uv * 2 + st]));
+        for (unsigned rgb = 0; rgb < 3; ++rgb)
+          h = mix64(h ^ std::bit_cast<uint32_t>(vertex[gxc::kVertexColor0Offset / sizeof(float) + rgb]));
+      }
+    } else if (plan.draw_tag != 0) {
       h = mix64(h ^ (uint64_t(plan.draw_tag) << 20) ^ 0x7A6u);
+    }
+    return h == 0 ? 1 : h;
+  }
+  if (blends_vertices(plan) && plan.match_position_size > 0 && plan.match_position_size <= 2 &&
+      plan.match_position_offset + plan.match_position_size <= plan.match_vertex_stride &&
+      plan.match_payload_size == plan.vertex_count * plan.match_vertex_stride) {
+    // CPU-deformed indexed meshes retain their vertex correspondence when
+    // direct UVs animate or the ocean grid follows the player. Frame-allocated
+    // position buffers change address, so use the material and topology;
+    // repeated meshes are paired by the existing copy-motion checks.
+    h = mix64(h ^ (uint64_t(plan.tex_address) << 32) ^
+              (uint64_t(plan.texmap_mask) << 24));
+    for (uint32_t v = 0; v < plan.vertex_count; ++v) {
+      const uint8_t* index = plan.match_payload + v * plan.match_vertex_stride + plan.match_position_offset;
+      uint32_t value = index[0];
+      if (plan.match_position_size == 2)
+        value = (value << 8) | index[1];
+      h = (h ^ mix64(value)) * 0x9E3779B97F4A7C15ull;
+    }
     return h == 0 ? 1 : h;
   }
   const uint8_t* bytes = plan.match_payload;
@@ -1341,15 +1393,28 @@ static uint64_t draw_key_of(const gxc::DrawPlan& plan) noexcept {
 
 uint64_t draw_key(const gxc::DrawPlan& plan) noexcept { return draw_key_of(plan); }
 
+bool blends_vertices(const gxc::DrawPlan& plan) noexcept {
+  const size_t decoded = plan.vertices.size() / gxc::kVertexFloats;
+  return decoded > 0 && decoded <= kMaxBlendedVertices && !plan.pipeline.shader.has_pos_mtx_idx &&
+         (!plan.match_direct_position || plan.draw_tag != 0 || plan.draw_scope_part != 0 ||
+          screen_space_sprite(plan));
+}
+
 void capture_draw(const gxc::DrawPlan& plan, DrawInput& out) noexcept {
   out.key = draw_key_of(plan);
   out.usedMatrixRows = used_matrix_rows(plan);
   out.haveSamples = false;
   out.positions.clear();
+  out.texcoords.clear();
+  out.texcoordMask = 0;
+  out.tagged = false;
   out.age = 0;
+  out.screenSpace = screen_space_sprite(plan);
+  out.screenCenter = {};
+  out.screenExtent = {};
   if (out.key == 0)
     return;
-  // Only the positions of particles the host tagged: an untagged draw of one
+  // Screen sprites and particles the host tagged: an untagged world draw of one
   // shape is not the same points from one frame to the next (the boat's
   // shadow is cast on the sea's triangles under it, a different list as it
   // moves), and blending one list toward the other drew the shadow torn.
@@ -1359,13 +1424,61 @@ void capture_draw(const gxc::DrawPlan& plan, DrawInput& out) noexcept {
   // particle's are.
   const bool cloth = !plan.match_direct_position && plan.draw_scope_part != 0;
   if (plan.match_direct_position || cloth) {
-    if ((plan.draw_tag != 0 || plan.draw_scope_part != 0) && decoded > 0 && decoded <= kMaxBlendedVertices) {
+    if ((out.screenSpace || plan.draw_tag != 0 || plan.draw_scope_part != 0) && decoded > 0 &&
+        decoded <= kMaxBlendedVertices) {
       out.positions.resize(decoded * 3u);
       for (size_t i = 0; i < decoded; ++i)
         std::memcpy(out.positions.data() + i * 3u,
                     plan.vertices.data() + i * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float),
                     sizeof(float) * 3);
-      out.age = plan.draw_scope_part != 0 ? 0u : plan.draw_tag_age;
+      out.age = out.screenSpace || plan.draw_scope_part != 0 ? 0u : plan.draw_tag_age;
+      out.tagged = !out.screenSpace;
+      if (out.screenSpace) {
+        std::array<float, 2> low{INFINITY, INFINITY}, high{-INFINITY, -INFINITY};
+        for (size_t i = 0; i < decoded; ++i) {
+          const float* p = out.positions.data() + i * 3u;
+          for (unsigned r = 0; r < 2; ++r) {
+            const auto& m = plan.constants.posnormalmatrix[r];
+            const float value = m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3];
+            if (!std::isfinite(value)) {
+              out.key = 0;
+              out.positions.clear();
+              return;
+            }
+            low[r] = std::min(low[r], value);
+            high[r] = std::max(high[r], value);
+          }
+        }
+        for (unsigned r = 0; r < 2; ++r) {
+          out.screenCenter[r] = (low[r] + high[r]) * .5f;
+          out.screenExtent[r] = high[r] - low[r];
+        }
+      }
+    }
+    return;
+  }
+  // Indexed topology identifies the same vertices across frames. CPU-deformed
+  // meshes (water, cloth, CPU skinning) need each vertex blended: fitting a
+  // rigid transform to three samples pulls adjacent strips apart. Matrix-
+  // skinned models still interpolate their bones, without a second blend.
+  if (blends_vertices(plan)) {
+    out.positions.resize(decoded * 3u);
+    for (size_t i = 0; i < decoded; ++i)
+      std::memcpy(out.positions.data() + i * 3u,
+                  plan.vertices.data() + i * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float),
+                  sizeof(float) * 3);
+    out.texcoordMask = plan.match_direct_texcoord_mask & ((1u << gxc::kMaxTexGens) - 1u);
+    const size_t uvStride = 2u * std::popcount(out.texcoordMask);
+    out.texcoords.resize(decoded * uvStride);
+    for (size_t v = 0; v < decoded; ++v) {
+      size_t at = v * uvStride;
+      for (unsigned uv = 0; uv < gxc::kMaxTexGens; ++uv)
+        if ((out.texcoordMask >> uv) & 1u) {
+          std::memcpy(out.texcoords.data() + at,
+                      plan.vertices.data() + v * gxc::kVertexFloats + gxc::kVertexUvOffset / sizeof(float) + uv * 2u,
+                      sizeof(float) * 2);
+          at += 2;
+        }
     }
     return;
   }
@@ -1399,7 +1512,7 @@ uint64_t used_matrix_rows(const gxc::DrawPlan& plan) noexcept {
 
 static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedMatrixRows,
                                                    const gxc::VertexShaderConstants& current, bool repeatsLastDraw,
-                                                   const VertexSamples* samples) {
+                                                   const VertexSamples* samples, const DrawInput* screenSprite) {
   g_outcome = "no key";
   g_blendRepeated = false;
   const uint64_t serial = ++g_drawSerial;
@@ -1449,6 +1562,13 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
   }
   frame.records.push_back(
       {key, constantsIndex, samplesIndex, {here[0][3], here[1][3], here[2][3]}, false, kNoSamples, 0, g_currentAge});
+  if (screenSprite != nullptr) {
+    auto& record = frame.records.back();
+    for (unsigned r = 0; r < 2; ++r)
+      record.position[r] = screenSprite->screenCenter[r];
+    record.position[2] = 0.f;
+    record.screenExtent = screenSprite->screenExtent;
+  }
   ++g_frameCounts.draws;
   KeyState& state = g_keys[key];
   const uint32_t occurrence = state.occurrence++;
@@ -1504,6 +1624,65 @@ static const gxc::VertexShaderConstants* match_draw(uint64_t key, uint64_t usedM
     return copy == 0 && movedPrevious != nullptr ? *movedPrevious : previousFrame.pool[copies[copy].constants];
   };
   const size_t candidates = static_cast<size_t>(range.second - range.first);
+  if (screenSprite != nullptr) {
+    // The nearest matching screen rectangle, consumed once. Occurrence can
+    // change when a counter reuses a glyph or a heart adds an animated copy.
+    // A newly visible digit must not borrow a distant rupee/heart sprite.
+    size_t best = candidates;
+    double score = HUGE_VAL;
+    for (size_t i = 0; i < candidates; ++i) {
+      if (copies[i].screenConsumed)
+        continue;
+      const double width = std::min(screenSprite->screenExtent[0], copies[i].screenExtent[0]);
+      const double height = std::min(screenSprite->screenExtent[1], copies[i].screenExtent[1]);
+      if (!(width > 0.0 && height > 0.0))
+        continue;
+      const double reach = std::max(2.0, 0.2 * std::min(width, height));
+      const double dx = screenSprite->screenCenter[0] - copies[i].position[0];
+      const double dy = screenSprite->screenCenter[1] - copies[i].position[1];
+      const double distance = dx * dx + dy * dy;
+      if (distance > reach * reach || !plausible(current, constantsOf(i), usedMatrixRows, kOwnTurnLimit))
+        continue;
+      const double dw = screenSprite->screenExtent[0] - copies[i].screenExtent[0];
+      const double dh = screenSprite->screenExtent[1] - copies[i].screenExtent[1];
+      const double candidateScore = distance + .05 * (dw * dw + dh * dh);
+      if (candidateScore < score) {
+        best = i;
+        score = candidateScore;
+      }
+    }
+    if (best == candidates) {
+      ++g_frameCounts.rejected;
+      g_outcome = "screen sprite new or discontinuous";
+      return nullptr;
+    }
+    range.first[best].screenConsumed = true;
+    const auto& previous = constantsOf(best);
+    g_match = {&copies[best], &previous, nullptr};
+    ++g_frameCounts.matched;
+    if (repeat(BlendPath::Main, &previous, nullptr)) {
+      if (g_lastBlend.identical) {
+        ++g_frameCounts.identical;
+        g_outcome = "screen sprite identical";
+        return nullptr;
+      }
+      ++g_frameCounts.blended;
+      g_outcome = "screen sprite blended";
+      g_blendRepeated = true;
+      return &g_blended[0];
+    }
+    g_lastBlend.identical = std::memcmp(&previous, &current, sizeof(current)) == 0;
+    if (g_lastBlend.identical) {
+      ++g_frameCounts.identical;
+      g_outcome = "screen sprite identical";
+      return nullptr;
+    }
+    for (int step = 0; step < g_frameSteps; ++step)
+      blend(previous, current, float(step_weight(step)), g_blended[step], usedMatrixRows);
+    ++g_frameCounts.blended;
+    g_outcome = "screen sprite blended";
+    return &g_blended[0];
+  }
   const double turnLimit = candidates == 1 && occurrence == 0 ? kOwnTurnLimit : kTurnLimit;
   const gxc::VertexShaderConstants* previous = nullptr;
   size_t chosen = 0; // previous's copy
@@ -1803,15 +1982,17 @@ const gxc::VertexShaderConstants* blend_draw(const DrawInput& input, const gxc::
                                              bool repeatsLastDraw, const gxc::PixelShaderConstants* pixel) {
   g_haveBlendedPositions = false;
   g_haveBlendedPixel = false;
+  g_blendedTexcoordMask = 0;
   g_match = {};
   const bool havePositions = !input.positions.empty();
   const uint32_t count = static_cast<uint32_t>(input.positions.size() / 3u);
-  g_currentTagged = havePositions;
-  g_currentAge = havePositions ? input.age : 0u;
+  g_currentTagged = input.tagged;
+  g_currentAge = input.tagged ? input.age : 0u;
   FrameRecords& frame = g_frames[g_current];
   const size_t recorded = frame.records.size();
   const gxc::VertexShaderConstants* result = match_draw(input.key, input.usedMatrixRows, current, repeatsLastDraw,
-                                                        input.haveSamples ? &input.samples : nullptr);
+                                                        input.haveSamples ? &input.samples : nullptr,
+                                                        input.screenSpace ? &input : nullptr);
   g_currentTagged = false;
   g_currentAge = 0;
   if (pixel != nullptr)
@@ -1824,6 +2005,12 @@ const gxc::VertexShaderConstants* blend_draw(const DrawInput& input, const gxc::
   record.positions = static_cast<uint32_t>(frame.positions.size() / 3u);
   record.positionCount = count;
   frame.positions.insert(frame.positions.end(), input.positions.begin(), input.positions.end());
+  const size_t uvStride = 2u * std::popcount(input.texcoordMask);
+  if (uvStride != 0 && input.texcoords.size() == count * uvStride) {
+    record.texcoords = static_cast<uint32_t>(frame.texcoords.size());
+    record.texcoordMask = input.texcoordMask;
+    frame.texcoords.insert(frame.texcoords.end(), input.texcoords.begin(), input.texcoords.end());
+  }
   const Record* before = g_match.record;
   if (before == nullptr || g_match.block == nullptr || before->positions == kNoSamples ||
       before->positionCount != count)
@@ -1831,21 +2018,68 @@ const gxc::VertexShaderConstants* blend_draw(const DrawInput& input, const gxc::
   const FrameRecords& previousFrame = g_frames[g_current ^ 1u];
   const float* now = frame.positions.data() + static_cast<size_t>(record.positions) * 3u;
   const float* then = previousFrame.positions.data() + static_cast<size_t>(before->positions) * 3u;
+  // Static geometry already gets its camera motion from the matrix blend.
+  const bool staticPositions = !input.tagged &&
+      std::memcmp(then, now, static_cast<size_t>(count) * 3u * sizeof(float)) == 0;
   // Each step's, through that step's in-between matrix; none unless every
   // step's is plausible and one moves.
   bool moves = false;
-  for (int step = 0; step < g_frameSteps; ++step) {
+  for (int step = 0; !staticPositions && step < g_frameSteps; ++step) {
     const float(*inBetween)[4] = result != nullptr ? g_blended[step].posnormalmatrix : current.posnormalmatrix;
     const bool moved = blend_positions(then, now, count, g_match.block->posnormalmatrix, current.posnormalmatrix,
-                                       g_match.motion, step, inBetween, step_weight(step), true,
+                                       g_match.motion, step, inBetween, step_weight(step), input.tagged,
                                        g_blendedPositions[step]);
     if (!moved && g_blendedPositions[step].size() != static_cast<size_t>(count) * 3u)
       return result; // implausible
     moves = moves || moved;
   }
   g_haveBlendedPositions = moves;
-  if (g_haveBlendedPositions)
+  if (g_haveBlendedPositions) {
     ++g_frameCounts.positions;
+    // UI geometry can animate without changing its uniform matrix. A menu
+    // consisting only of those sprites still needs its in-between frames.
+    if (input.screenSpace && result == nullptr)
+      ++g_frameCounts.blended;
+  }
+  // The ocean's grid follows the player. Using current-frame UVs on blended
+  // positions makes its texture slide in 30-Hz steps despite smooth waves.
+  // Only interpolate direct UVs with indexed vertex correspondence; particles
+  // and matrix-skinned geometry retain their existing paths.
+  if (record.texcoords != kNoSamples && before->texcoords != kNoSamples &&
+      before->texcoordMask == record.texcoordMask) {
+    const float* uv0 = previousFrame.texcoords.data() + before->texcoords;
+    const float* uv1 = frame.texcoords.data() + record.texcoords;
+    if (std::memcmp(uv0, uv1, count * uvStride * sizeof(float)) == 0)
+      return result;
+    bool uvMoves = false;
+    for (int step = 0; step < g_frameSteps; ++step)
+      g_blendedTexcoords[step].assign(uv1, uv1 + count * uvStride);
+    for (size_t channel = 0; channel < uvStride; channel += 2) {
+      bool continuous = true;
+      for (uint32_t v = 0; continuous && v < count; ++v)
+        for (unsigned st = 0; st < 2; ++st) {
+          const size_t at = v * uvStride + channel + st;
+          continuous = continuous && std::isfinite(uv0[at]) && std::isfinite(uv1[at]) &&
+                       std::fabs(uv1[at] - uv0[at]) <= .5f;
+        }
+      if (!continuous)
+        continue; // an atlas switch or wrap: keep this channel's current UVs
+      for (uint32_t v = 0; v < count; ++v)
+        for (unsigned st = 0; st < 2; ++st) {
+          const size_t at = v * uvStride + channel + st;
+          uvMoves = uvMoves || std::fabs(uv1[at] - uv0[at]) > 1e-7f * (1.f + std::fabs(uv1[at]));
+          for (int step = 0; step < g_frameSteps; ++step)
+            g_blendedTexcoords[step][at] = uv0[at] + (uv1[at] - uv0[at]) * float(step_weight(step));
+        }
+    }
+    if (uvMoves) {
+      g_blendedTexcoordMask = record.texcoordMask;
+      // UV-only animation still needs the frame to be interpolated even if
+      // every matrix is unchanged and match_draw() returned no uniform block.
+      if (result == nullptr)
+        ++g_frameCounts.blended;
+    }
+  }
   return result;
 }
 
@@ -1864,6 +2098,10 @@ const float* blended_positions(int step) noexcept {
 const gxc::PixelShaderConstants* blended_pixel(int step) noexcept {
   return g_haveBlendedPixel && step < g_frameSteps ? &g_blendedPixel[step] : nullptr;
 }
+const float* blended_texcoords(int step) noexcept {
+  return g_blendedTexcoordMask != 0 && step >= 0 && step < g_frameSteps ? g_blendedTexcoords[step].data() : nullptr;
+}
+uint8_t blended_texcoord_mask() noexcept { return g_blendedTexcoordMask; }
 
 const gxc::VertexShaderConstants* blended_step(int step) noexcept {
   return &g_blended[std::clamp(step, 0, kMaxSteps - 1)];

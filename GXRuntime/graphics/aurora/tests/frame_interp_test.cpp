@@ -99,7 +99,11 @@ static bool halfway(const Result& result, const Camera& before, const Camera& no
 // A draw submitted as gxcore_draw.cpp does: its inputs captured from the plan.
 static const gxc::VertexShaderConstants* blend_plan(const gxc::DrawPlan& plan, const gxc::VertexShaderConstants& c) {
   static fi::DrawInput input;
-  fi::capture_draw(plan, input);
+  // Production captures the same constants it then blends. Most synthetic
+  // plans above describe only geometry, so supply their transform here too.
+  auto submitted = plan;
+  submitted.constants = c;
+  fi::capture_draw(submitted, input);
   return fi::blend_draw(input, c);
 }
 
@@ -108,6 +112,142 @@ int main() {
   setenv("DOL_AURORA_FRAME_INTERP_PACING", "1", 1);
   fi::set_enabled(true);
   const uint64_t kShip = 11, kTree = 22, kHud = 33;
+
+  // Reused glyphs stay paired with their screen slot despite changing draw
+  // order/counts. Nearby UI movement and heart pulses still interpolate.
+  {
+    gxc::DrawPlan hud;
+    const uint8_t payload[96]{};
+    hud.match_payload = payload;
+    hud.match_payload_size = sizeof(payload);
+    hud.match_primitive = 0x80;
+    hud.match_direct_position = true;
+    hud.vertex_count = 4;
+    hud.tex_address = 0x00EA78A0;
+    hud.pipeline.shader.num_tex_gens = 1;
+    hud.vertices.resize(4 * gxc::kVertexFloats);
+    const auto quad = [&](float width, float height) {
+      for (unsigned v = 0; v < 4; ++v) {
+        auto* vertex = hud.vertices.data() + v * gxc::kVertexFloats;
+        vertex[gxc::kVertexPosOffset / sizeof(float)] = (v == 1 || v == 2) ? width : 0.f;
+        vertex[gxc::kVertexPosOffset / sizeof(float) + 1] = v >= 2 ? height : 0.f;
+        vertex[gxc::kVertexUvOffset / sizeof(float)] = (v == 1 || v == 2) ? 1.f : 0.f;
+        vertex[gxc::kVertexUvOffset / sizeof(float) + 1] = v >= 2 ? 1.f : 0.f;
+        for (unsigned c = 0; c < 4; ++c)
+          vertex[gxc::kVertexColor0Offset / sizeof(float) + c] = 1.f;
+      }
+    };
+    quad(20.f, 30.f);
+    const auto at = [](float x, float y) {
+      auto c = draw_at(x, y, 0.f);
+      std::memset(c.projection, 0, sizeof(c.projection));
+      c.projection[0][0] = 2.f / 640.f;
+      c.projection[1][1] = -2.f / 480.f;
+      c.projection[3][3] = 1.f;
+      return c;
+    };
+    hud.constants = at(412.f, 412.f);
+    // A stale particle tag must not distinguish otherwise identical UI.
+    hud.draw_tag = 123;
+    const auto key = fi::draw_key(hud);
+    CHECK(key != 0);
+    hud.draw_tag = 456;
+    CHECK(fi::draw_key(hud) == key);
+    hud.vertices[gxc::kVertexColor0Offset / sizeof(float) + 3] = .5f;
+    CHECK(fi::draw_key(hud) == key); // fade alpha may animate
+    hud.vertices[gxc::kVertexUvOffset / sizeof(float)] = .25f;
+    CHECK(fi::draw_key(hud) != key); // another atlas region is another glyph
+    quad(20.f, 30.f);
+    hud.vertices[gxc::kVertexColor0Offset / sizeof(float)] = 0.f;
+    CHECK(fi::draw_key(hud) != key); // a shadow is distinct from its foreground
+    quad(20.f, 30.f);
+    fi::set_steps(3);
+
+    blend_plan(hud, at(643.f, 443.f));
+    blend_plan(hud, at(412.f, 412.f));
+    fi::end_game_frame();
+    for (const auto c : {at(413.f, 412.f), at(642.f, 443.f)}) {
+      const auto* blended = blend_plan(hud, c);
+      CHECK(blended != nullptr);
+      if (blended != nullptr) {
+        const float beforeX = c.posnormalmatrix[0][3] == 413.f ? 412.f : 643.f;
+        for (int step = 0; step < 3; ++step)
+          CHECK(near(fi::blended_step(step)->posnormalmatrix[0][3],
+                     beforeX + (c.posnormalmatrix[0][3] - beforeX) * float(step + 1) / 4.f));
+      }
+    }
+    CHECK(fi::frame_verdict());
+    fi::end_game_frame();
+    // The timer changes to another digit; next frame the shared glyph returns
+    // without borrowing the only remaining copy, at the distant rupee counter.
+    blend_plan(hud, at(642.f, 443.f));
+    fi::end_game_frame();
+    CHECK(blend_plan(hud, at(412.f, 412.f)) == nullptr);
+    CHECK(fi::blended_positions() == nullptr);
+    CHECK(blend_plan(hud, at(641.f, 443.f)) != nullptr);
+    // A new copy cannot reuse the same counterpart already consumed above.
+    CHECK(blend_plan(hud, at(640.f, 443.f)) == nullptr);
+    fi::end_game_frame();
+
+    // The last heart grows about its own centre, not a neighbouring heart.
+    blend_plan(hud, at(170.f, 40.f));
+    blend_plan(hud, at(195.f, 40.f));
+    fi::end_game_frame();
+    auto pulse = at(168.f, 37.f);
+    pulse.posnormalmatrix[0][0] = pulse.posnormalmatrix[1][1] = 1.2f;
+    CHECK(blend_plan(hud, pulse) != nullptr);
+    for (int step = 0; step < 3; ++step) {
+      const auto* b = fi::blended_step(step);
+      CHECK(b != nullptr);
+      if (b != nullptr) {
+        CHECK(near(b->posnormalmatrix[0][0], 1.f + .2f * float(step + 1) / 4.f));
+        CHECK(near(b->posnormalmatrix[0][3] + 10.f * b->posnormalmatrix[0][0], 180.f));
+        CHECK(near(b->posnormalmatrix[1][3] + 15.f * b->posnormalmatrix[1][1], 55.f));
+      }
+    }
+    CHECK(blend_plan(hud, at(195.f, 40.f)) == nullptr); // the neighbour stays still
+    fi::end_game_frame();
+
+    // A UI pulse can also resize its direct vertices with a fixed matrix.
+    quad(20.f, 30.f);
+    blend_plan(hud, at(170.f, 40.f));
+    fi::end_game_frame();
+    quad(22.f, 32.f);
+    blend_plan(hud, at(170.f, 40.f));
+    for (int step = 0; step < 3; ++step) {
+      const auto* b = fi::blended_positions(step);
+      CHECK(b != nullptr);
+      if (b != nullptr) {
+        CHECK(near(b[3], 20.f + 2.f * float(step + 1) / 4.f));
+        CHECK(near(b[7], 30.f + 2.f * float(step + 1) / 4.f));
+      }
+    }
+    CHECK(fi::frame_verdict());
+    fi::end_game_frame();
+
+    // Invalid bounds do not leave a stale interpolated vertex buffer behind.
+    hud.constants = at(170.f, 40.f);
+    hud.vertices[0] = INFINITY;
+    fi::DrawInput invalid;
+    fi::capture_draw(hud, invalid);
+    CHECK(invalid.key == 0);
+    CHECK(fi::blend_draw(invalid, hud.constants) == nullptr);
+    CHECK(fi::blended_positions() == nullptr);
+    quad(20.f, 30.f);
+    // Orthographic depth-buffer geometry and perspective particles retain
+    // their existing identities and interpolation paths.
+    hud.pipeline.depth_test = 1;
+    CHECK(fi::draw_key(hud) != key);
+    hud.pipeline.depth_test = 0;
+    hud.pipeline.depth_update = 1;
+    CHECK(fi::draw_key(hud) != key);
+    hud.pipeline.depth_update = 0;
+    hud.constants.projection[3][2] = -1.f;
+    CHECK(fi::draw_key(hud) != key);
+    fi::set_steps(1);
+    fi::end_game_frame();
+    fi::end_game_frame();
+  }
 
   // Frame 1: the ship, two trees, the HUD.
   CHECK(fi::blend_draw(kShip, 0, draw_at(0, 0, -500)) == nullptr); // no previous frame yet
@@ -575,10 +715,11 @@ int main() {
         seen_at(view.posnormalmatrix, &plan.vertices[v * gxc::kVertexFloats], drawn[frame][v]);
       const auto* got = blend_plan(plan, view);
       if (frame == 2) {
-        hullHalfway = got != nullptr;
+        const float* vertices = fi::blended_positions();
+        hullHalfway = vertices != nullptr;
         for (int v = 0; hullHalfway && v < 6; ++v) {
           float at[3];
-          seen_at(got->posnormalmatrix, &plan.vertices[v * gxc::kVertexFloats], at);
+          seen_at(got != nullptr ? got->posnormalmatrix : view.posnormalmatrix, vertices + v * 3, at);
           for (int r = 0; r < 3; ++r)
             hullHalfway = hullHalfway && std::fabs(at[r] - (drawn[1][v][r] + drawn[2][v][r]) / 2.f) < 1.f;
         }
@@ -587,6 +728,135 @@ int main() {
       fi::end_game_frame();
     }
     CHECK(hullHalfway);
+  }
+
+  // Adjacent CPU-deformed ocean strips share a vertex, but have different
+  // wave heights elsewhere. Every 120-Hz step must keep that shared edge
+  // together, including at large world coordinates and with camera motion.
+  for (bool movingCamera : {false, true}) {
+    fi::end_game_frame();
+    fi::end_game_frame();
+    fi::set_steps(3);
+    uint8_t payload[2][40]{};
+    float shared[3][2][3]{};
+    for (int frame = 0; frame < 3; ++frame) {
+      const Camera c{0.f, -200000.f + (movingCamera ? 20.f * frame : 0.f), 2000.f};
+      const auto view = seen(c.yaw, c.x, c.z, 0.f, 0.f, 0.f);
+      for (int room = 0; room < 8; ++room)
+        fi::blend_draw(18000 + room, 0, seen(c.yaw, c.x, c.z, -200000.f + room * 500.f, 0.f, -5000.f));
+      for (int strip = 0; strip < 2; ++strip) {
+        gxc::DrawPlan plan;
+        for (int v = 0; v < 4; ++v) {
+          payload[strip][v * 10 + 1] = static_cast<uint8_t>(strip * 2 + v);
+          const float uv[2] = {float(frame), float(v)};
+          std::memcpy(payload[strip] + v * 10 + 2, uv, sizeof(uv));
+        }
+        plan.match_payload = payload[strip];
+        plan.match_payload_size = sizeof(payload[strip]);
+        plan.match_primitive = 0x98;
+        plan.match_vertex_stride = 10;
+        plan.match_position_size = 2;
+        plan.match_direct_texcoord_mask = (1u << 0) | (1u << 2);
+        plan.vertex_count = 4;
+        plan.vertices.assign(4 * gxc::kVertexFloats, 0.f);
+        for (int v = 0; v < 4; ++v) {
+          const int index = strip * 2 + v;
+          float* p = plan.vertices.data() + v * gxc::kVertexFloats;
+          p[0] = -200000.f + 800.f * (index / 2) + (movingCamera ? 20.f * frame : 0.f);
+          p[1] = float((index * index + 3) * frame); // non-rigid deformation
+          p[2] = -800.f * (index % 2);
+          float* uv = p + gxc::kVertexUvOffset / sizeof(float);
+          uv[0] = p[0] * .0005f;
+          uv[1] = p[2] * .0005f;
+          uv[4] = .02f * frame; // another direct channel, also animated
+          uv[5] = .1f * index;
+        }
+        const auto* got = blend_plan(plan, view);
+        if (frame == 2) {
+          for (int step = 0; step < 3; ++step) {
+            const float* vertices = fi::blended_positions(step);
+            const float* texcoords = fi::blended_texcoords(step);
+            CHECK(vertices != nullptr);
+            CHECK(texcoords != nullptr);
+            CHECK(fi::blended_texcoord_mask() == ((1u << 0) | (1u << 2)));
+            if (vertices == nullptr)
+              continue;
+            const float t = float(step + 1) / 4.f;
+            for (int v = 0; v < 4; ++v) {
+              const int index = strip * 2 + v;
+              CHECK(std::fabs(vertices[v * 3 + 1] - (index * index + 3) * (1.f + t)) < .01f);
+              CHECK(std::fabs(vertices[v * 3] - (-200000.f + 800.f * (index / 2) +
+                    (movingCamera ? 20.f * (1.f + t) : 0.f))) < .05f);
+              if (texcoords != nullptr) {
+                // Both attributes describe the same intermediate world point.
+                CHECK(std::fabs(texcoords[v * 4] - vertices[v * 3] * .0005f) < 2e-5f);
+                CHECK(std::fabs(texcoords[v * 4 + 1] - vertices[v * 3 + 2] * .0005f) < 2e-5f);
+                CHECK(std::fabs(texcoords[v * 4 + 2] - .02f * (1.f + t)) < 1e-6f);
+                CHECK(std::fabs(texcoords[v * 4 + 3] - .1f * index) < 1e-6f);
+              }
+            }
+            const float* p = vertices + (strip == 0 ? 2 : 0) * 3;
+            const float (*m)[4] = got != nullptr ? fi::blended_step(step)->posnormalmatrix : view.posnormalmatrix;
+            for (int r = 0; r < 3; ++r)
+              shared[step][strip][r] = m[r][0] * p[0] + m[r][1] * p[1] + m[r][2] * p[2] + m[r][3];
+          }
+        }
+      }
+      if (frame == 2)
+        for (int step = 0; step < 3; ++step)
+          for (int r = 0; r < 3; ++r)
+            CHECK(std::fabs(shared[step][0][r] - shared[step][1][r]) < .01f);
+      fi::end_game_frame();
+    }
+    fi::set_steps(1);
+  }
+
+  // Direct UV animation also blends when the mesh itself stays still. An
+  // atlas switch/wrap keeps its current channel instead of sweeping across it.
+  for (bool wraps : {false, true}) {
+    fi::end_game_frame();
+    fi::end_game_frame();
+    fi::set_steps(3);
+    uint8_t payload[8] = {0, 0, 0, 1, 0, 2, 0, 3};
+    for (int frame = 0; frame < 2; ++frame) {
+      gxc::DrawPlan plan;
+      plan.match_payload = payload;
+      plan.match_payload_size = sizeof(payload);
+      plan.match_primitive = 0x98;
+      plan.match_vertex_stride = 2;
+      plan.match_position_size = 2;
+      plan.match_direct_texcoord_mask = (1u << 0) | (1u << 2);
+      plan.vertex_count = 4;
+      plan.vertices.assign(4 * gxc::kVertexFloats, 0.f);
+      for (int v = 0; v < 4; ++v) {
+        float* p = plan.vertices.data() + v * gxc::kVertexFloats;
+        p[0] = v * 20.f;
+        p[2] = -400.f;
+        float* uv = p + gxc::kVertexUvOffset / sizeof(float);
+        uv[0] = wraps ? (frame == 0 ? .98f : .02f) : .1f + .04f * frame;
+        uv[1] = .2f;
+        uv[4] = .3f + .02f * frame;
+        uv[5] = .4f;
+      }
+      blend_plan(plan, draw_at(0, 0, 0));
+      if (frame == 1) {
+        CHECK(fi::blended_positions() == nullptr);
+        CHECK(fi::blended_texcoord_mask() == ((1u << 0) | (1u << 2)));
+        CHECK(fi::frame_verdict());
+        for (int step = 0; step < 3; ++step) {
+          const float* uv = fi::blended_texcoords(step);
+          CHECK(uv != nullptr);
+          if (uv != nullptr)
+            for (int v = 0; v < 4; ++v) {
+              const float t = float(step + 1) / 4.f;
+              CHECK(std::fabs(uv[v * 4] - (wraps ? .02f : .1f + .04f * t)) < 1e-6f);
+              CHECK(std::fabs(uv[v * 4 + 2] - (.3f + .02f * t)) < 1e-6f);
+            }
+        }
+      }
+      fi::end_game_frame();
+    }
+    fi::set_steps(1);
   }
 
   // A bone of Link's sword arm turns 100 degrees in one game frame: a draw

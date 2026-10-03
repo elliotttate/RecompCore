@@ -1151,15 +1151,25 @@ struct InterpJob {
   gxc::PixelShaderConstants pixel;
 };
 
-// A particle's in-between vertices: its own, with the blended positions, in
-// the in-between vertex area of `slot`.
+// A draw's in-between vertices: replace its blended positions and direct UVs
+// while preserving all other attributes in the current vertex stream.
 Range push_blended_vertices(size_t slot, const std::vector<float>& vertices, const float* positions,
-                            std::vector<float>& scratch) {
+                            const float* texcoords, uint8_t texcoordMask, std::vector<float>& scratch) {
   scratch.assign(vertices.begin(), vertices.end());
   const size_t count = scratch.size() / gxc::kVertexFloats;
-  for (size_t i = 0; i < count; ++i)
-    std::memcpy(scratch.data() + i * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float), positions + i * 3u,
-                sizeof(float) * 3u);
+  size_t uvAt = 0;
+  for (size_t i = 0; i < count; ++i) {
+    float* vertex = scratch.data() + i * gxc::kVertexFloats;
+    if (positions != nullptr)
+      std::memcpy(vertex + gxc::kVertexPosOffset / sizeof(float), positions + i * 3u, sizeof(float) * 3u);
+    if (texcoords != nullptr)
+      for (unsigned uv = 0; uv < gxc::kMaxTexGens; ++uv)
+        if ((texcoordMask >> uv) & 1u) {
+          std::memcpy(vertex + gxc::kVertexUvOffset / sizeof(float) + uv * 2u,
+                      texcoords + uvAt, sizeof(float) * 2u);
+          uvAt += 2;
+        }
+  }
   return push_interp_vertices(slot, reinterpret_cast<const uint8_t*>(scratch.data()), scratch.size() * sizeof(float));
 }
 
@@ -1241,8 +1251,11 @@ void interp_helper_main(InterpHelper* h) {
                                       sizeof(gxc::VertexShaderConstants), repeated);
     }
     for (int step = 0; step < steps; ++step) {
-      if (const float* positions = frame_interp::blended_positions(step))
-        ranges.verts[step] = push_blended_vertices(job.slot, job.vertices, positions, h->vertices);
+      const float* positions = frame_interp::blended_positions(step);
+      const float* texcoords = frame_interp::blended_texcoords(step);
+      if (positions != nullptr || texcoords != nullptr)
+        ranges.verts[step] = push_blended_vertices(job.slot, job.vertices, positions, texcoords,
+                                                 frame_interp::blended_texcoord_mask(), h->vertices);
       if (const gxc::PixelShaderConstants* pixel = frame_interp::blended_pixel(step))
         ranges.pixel[step] = push_interp_uniform_dedup(h->pixelCache[step], job.frameId, job.slot,
                                                        reinterpret_cast<const uint8_t*>(pixel), sizeof(*pixel), false);
@@ -1379,12 +1392,12 @@ static void dump_draw(const gxc::DrawPlan& plan) {
     const auto& t = sh.tev_stages[i];
     std::fprintf(stderr,
                  "[draw-dump]   s%u tc%u map%u en%u ras%u  C=%u,%u,%u,%u op%u b%u s%u cl%u ->%u  "
-                 "A=%u,%u,%u,%u op%u b%u s%u cl%u ->%u  k=%u/%u  ind: st%u fmt%u bias%u mtx%u id%u wrap%u,%u add%u\n",
+                 "A=%u,%u,%u,%u op%u b%u s%u cl%u ->%u  k=%u/%u  ind: st%u fmt%u bias%u mtx%u id%u wrap%u,%u add%u lod%u\n",
                  i, t.tevorders_texcoord, t.tevorders_texmap, t.tevorders_enable, t.tevorders_colorchan, t.cc_a,
                  t.cc_b, t.cc_c, t.cc_d, t.cc_op, t.cc_bias, t.cc_scale, t.cc_clamp, t.cc_dest, t.ac_a, t.ac_b, t.ac_c,
                  t.ac_d, t.ac_op, t.ac_bias, t.ac_scale, t.ac_clamp, t.ac_dest, t.ksel_kc, t.ksel_ka, t.ind_stage,
                  t.ind_format, t.ind_bias, t.ind_matrix_index, t.ind_matrix_id, t.ind_wrap_s, t.ind_wrap_t,
-                 t.ind_add_prev);
+                 t.ind_add_prev, t.ind_use_original_lod);
   }
   for (uint32_t i = 0; i < sh.num_ind_stages && i < 4u; ++i)
     std::fprintf(stderr, "[draw-dump]   ind%u map%u tc%u scale=%u,%u\n", i, sh.ind_stages[i].texmap,
@@ -1823,16 +1836,19 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // The helper is idle while a frame is traced, so its areas are ours.
   static std::vector<float> tracedVertices;
   const float* tracedPositions = matchHere ? frame_interp::blended_positions() : nullptr;
+  const float* tracedTexcoords = matchHere ? frame_interp::blended_texcoords() : nullptr;
   const Range interpVertRange =
-      tracedPositions != nullptr
-          ? push_blended_vertices(recording_frame_slot(), plan.vertices, tracedPositions, tracedVertices)
+      tracedPositions != nullptr || tracedTexcoords != nullptr
+          ? push_blended_vertices(recording_frame_slot(), plan.vertices, tracedPositions, tracedTexcoords,
+                                  frame_interp::blended_texcoord_mask(), tracedVertices)
           : Range{};
   if (frame_interp::tracing()) {
     const auto& m = plan.constants.posnormalmatrix;
     std::fprintf(stderr,
                  "[frame-interp-trace] frame=%llu %s key=%016llx prim=0x%02X fmt=%u verts=%u payload=%u idx=%d "
                  "t=(%.1f,%.1f,%.1f) s=%.3f proj00=%.3f proj32=%.1f tex=%08X bt=(%.1f,%.1f,%.1f) bt0=(%.1f,%.1f,%.1f) "
-                 "direct=%d tag=%06X age=%u scope=%06X:%u positions=%d\n",
+                 "direct=%d tag=%06X age=%u scope=%06X:%u positions=%d uv_mask=%u uv0=(%.7f,%.7f) buv0=(%.7f,%.7f) "
+                 "bp0=(%.3f,%.3f,%.3f)\n",
                  static_cast<unsigned long long>(frame_interp::game_frame_number()), frame_interp::last_outcome(),
                  static_cast<unsigned long long>(frame_interp::draw_key(plan)),
                  plan.match_primitive, plan.match_vtx_fmt, plan.vertex_count, plan.match_payload_size,
@@ -1846,7 +1862,14 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                  interpConstants ? interpConstants->transformmatrices[1][3] - plan.constants.transformmatrices[1][3] : 0.f,
                  interpConstants ? interpConstants->transformmatrices[2][3] - plan.constants.transformmatrices[2][3] : 0.f,
                  plan.match_direct_position ? 1 : 0, plan.draw_tag, plan.draw_tag_age, plan.draw_scope, plan.draw_scope_part,
-                 tracedPositions != nullptr ? 1 : 0);
+                 tracedPositions != nullptr ? 1 : 0, frame_interp::blended_texcoord_mask(),
+                 plan.vertices.empty() ? 0.f : plan.vertices[gxc::kVertexUvOffset / sizeof(float)],
+                 plan.vertices.empty() ? 0.f : plan.vertices[gxc::kVertexUvOffset / sizeof(float) + 1],
+                 tracedTexcoords != nullptr ? tracedTexcoords[0] : 0.f,
+                 tracedTexcoords != nullptr ? tracedTexcoords[1] : 0.f,
+                 tracedPositions != nullptr ? tracedPositions[0] : 0.f,
+                 tracedPositions != nullptr ? tracedPositions[1] : 0.f,
+                 tracedPositions != nullptr ? tracedPositions[2] : 0.f);
   }
   // (Room too for a pixel block of the ubershader's, should the draw need one.)
   const size_t pixelRoom = pixelUniformBytes + sizeof(gxc::UberPixelConstants);
@@ -1884,7 +1907,8 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     depthConfig.depthOnly = 1u;
     depthPipeline = pipeline_ref(depthConfig);
   }
-  const bool ownVertices = plan.draw_tag != 0 || plan.draw_scope_part != 0;
+  const bool ownVertices = plan.draw_tag != 0 || plan.draw_scope_part != 0 ||
+                           (interpolating && frame_interp::blends_vertices(plan));
 
   // The ubershader (gxcore_uber.cpp): a draw whose own pipeline is still
   // compiling is drawn with it, with the same result, rather than left out of
@@ -1983,7 +2007,9 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   const size_t vertexOffset = next_vertex_offset(gxc::kVertexStrideBytes);
   DrawData* batch = nullptr;
   uint32_t firstVertex = 0;
-  if (batching && !matchHere) {
+  // Independently blended vertices cannot share a batch's rebased index
+  // range. Keep their original draw order, including each depth/color pair.
+  if (batching && !matchHere && !ownVertices) {
     DrawData* last = last_recorded_draw();
     if (last != nullptr && uberPipeline == 0 && last->uberPipeline == 0 && last->pipeline == pipeline &&
         last->depthPipeline == depthPipeline &&

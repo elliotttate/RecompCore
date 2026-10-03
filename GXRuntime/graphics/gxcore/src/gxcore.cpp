@@ -677,6 +677,15 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
   }
 
   plan.match_direct_position = bits(vcd_lo_, 2, 9) == 1u; // VCD position: direct
+  for (std::uint32_t uv = 0; uv < kMaxTexGens; ++uv)
+    if (bits(vcd_hi_, 2, uv * 2) == 1u)
+      plan.match_direct_texcoord_mask |= 1u << uv;
+  if (!plan.match_direct_position) {
+    if (const auto* positions = find_array(draw, 0)) {
+      plan.match_position_offset = positions->vertex_offset;
+      plan.match_position_size = positions->index_size;
+    }
+  }
 
   // BP-derived pipeline state.
   const std::uint32_t gen_mode = bp_valid_[0x00] ? bp_regs_[0x00] : 0u;
