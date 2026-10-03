@@ -136,8 +136,22 @@ wgpu::AddressMode to_address_mode(std::uint8_t wrap) {
   }
 }
 
-wgpu::SamplerDescriptor sampler_descriptor(const gxc::PlanSampler& sampler) {
-  const bool mipmaps = sampler.mipmap_filter != 0u;
+// The levels a draw's texture has of its own: an HD replacement's mip chain
+// (decoded GameCube textures are uploaded with one level).
+uint32_t replacement_mips(const TextureHandle& texture) noexcept {
+  return texture && texture->isReplacement ? texture->mipCount : 1u;
+}
+
+// `textureMips`: replacement_mips() of the texture the sampler goes with.
+wgpu::SamplerDescriptor sampler_descriptor(const gxc::PlanSampler& sampler, uint32_t textureMips = 1u) {
+  // Most of Wind Waker's textures have no mips (TX_SETMODE0 filter 4), so their
+  // sampler stays on level 0. An HD replacement is several times their size and
+  // brings its own mips: drawn from level 0 alone it aliases at a distance, and
+  // shimmers and flickers as the camera turns. Like Dolphin (a custom texture's
+  // max LOD is 255), a replacement's levels are all used, blended linearly when
+  // the game asked for no mip filter.
+  const bool ownMips = textureMips > 1u;
+  const bool mipmaps = sampler.mipmap_filter != 0u || ownMips;
   std::uint16_t maxAnisotropy = 1;
   if (mipmaps && (sampler.max_aniso == 1u || sampler.max_aniso == 2u)) {
     maxAnisotropy = sampler.max_aniso == 1u
@@ -159,7 +173,7 @@ wgpu::SamplerDescriptor sampler_descriptor(const gxc::PlanSampler& sampler) {
                                              : wgpu::FilterMode::Nearest;
   auto minFilter = sampler.min_filter != 0u ? wgpu::FilterMode::Linear
                                              : wgpu::FilterMode::Nearest;
-  auto mipFilter = sampler.mipmap_filter == 2u
+  auto mipFilter = sampler.mipmap_filter == 2u || (ownMips && sampler.mipmap_filter == 0u)
                        ? wgpu::MipmapFilterMode::Linear
                        : wgpu::MipmapFilterMode::Nearest;
   if (maxAnisotropy > 1u) {
@@ -175,8 +189,10 @@ wgpu::SamplerDescriptor sampler_descriptor(const gxc::PlanSampler& sampler) {
       .magFilter = magFilter,
       .minFilter = minFilter,
       .mipmapFilter = mipFilter,
-      .lodMinClamp = mipmaps ? static_cast<float>(sampler.min_lod) / 16.f : 0.f,
-      .lodMaxClamp = mipmaps ? static_cast<float>(sampler.max_lod) / 16.f : 0.f,
+      .lodMinClamp = sampler.mipmap_filter != 0u ? static_cast<float>(sampler.min_lod) / 16.f : 0.f,
+      .lodMaxClamp = ownMips    ? static_cast<float>(textureMips - 1u)
+                     : mipmaps ? static_cast<float>(sampler.max_lod) / 16.f
+                               : 0.f,
       .maxAnisotropy = maxAnisotropy,
   };
 }
@@ -1738,7 +1754,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
               std::memcmp(&s_last.sampler, &samplerState, sizeof samplerState) == 0) {
             textureBindGroup = s_last.ref;
           } else {
-            const auto sampler = sampler_ref(sampler_descriptor(samplerState));
+            const auto sampler = sampler_ref(sampler_descriptor(samplerState, replacement_mips(bound)));
             const std::array entries{
                 WGPUBindGroupEntry{.binding = 0, .textureView = view},
                 WGPUBindGroupEntry{.binding = 1, .sampler = sampler.Get()},
@@ -1781,7 +1797,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
           break;
         }
         held[heldCount] = bound;
-        heldSamplers[heldCount] = sampler_ref(sampler_descriptor(plan.samplers[t]));
+        heldSamplers[heldCount] = sampler_ref(sampler_descriptor(plan.samplers[t], replacement_mips(bound)));
         entries[entryCount++] = WGPUBindGroupEntry{
             .binding = 2u * t, .textureView = bound->sampleTextureView.Get()};
         entries[entryCount++] = WGPUBindGroupEntry{
@@ -1946,7 +1962,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         complete = static_cast<bool>(held[0]);
         if (complete) {
           views.fill(held[0]->sampleTextureView.Get());
-          samplers.fill(sampler_ref(sampler_descriptor(plan.samplers[plan.tex_slot & 7u])));
+          samplers.fill(sampler_ref(sampler_descriptor(plan.samplers[plan.tex_slot & 7u], replacement_mips(held[0]))));
         }
       } else {
         for (uint32_t t = 0; t < 8u && complete; ++t) {
@@ -1960,7 +1976,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
           complete = static_cast<bool>(held[t]);
           if (complete) {
             views[t] = held[t]->sampleTextureView.Get();
-            samplers[t] = sampler_ref(sampler_descriptor(plan.samplers[t]));
+            samplers[t] = sampler_ref(sampler_descriptor(plan.samplers[t], replacement_mips(held[t])));
           }
         }
       }
