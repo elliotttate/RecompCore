@@ -1281,7 +1281,81 @@ void interp_helper_main(InterpHelper* h) {
   }
 }
 
-uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw, bool tev, bool pixelRepeats) {
+// Whether the game wrote this indexed draw's position array in this game
+// frame or the one before. Per array (its guest address), a hash of the bytes
+// its draws read, taken once a game frame, and the frame it last changed in;
+// an array seen for the first time counts as written. The frame before counts
+// too, so a mesh whose next positions are written before its draw is
+// recorded is still taken as moving. (The guest's cache flushes, which give
+// the texture cache its dirty epochs, miss small meshes the game writes
+// without one: a flag on the Forsaken Fortress.)
+// DOL_AURORA_INTERP_ALL_VERTICES=1 takes every such mesh as written.
+bool positions_written(const gxc::DrawPlan& plan) {
+  static const bool s_all = [] {
+    const char* env = std::getenv("DOL_AURORA_INTERP_ALL_VERTICES");
+    return env != nullptr && env[0] == '1';
+  }();
+  if (s_all || plan.match_direct_position || plan.match_position_span == 0 || plan.match_position_data == nullptr)
+    return true;
+  struct ArrayState {
+    uint64_t hash = 0;
+    uint64_t changed = 0; // the game frame its bytes last changed in
+    uint64_t hashed = 0;  // the game frame they were last hashed in
+    uint32_t span = 0;
+  };
+  static absl::flat_hash_map<uint32_t, ArrayState> s_arrays;
+  const uint64_t frame = frame_interp::game_frame_number();
+  // A model's draws mostly index one array in turn: the last answer, while
+  // its frame holds.
+  static uint32_t s_lastBase = 0, s_lastSpan = 0;
+  static uint64_t s_lastFrame = UINT64_MAX;
+  static bool s_lastWritten = true;
+  if (plan.match_position_base == s_lastBase && plan.match_position_span <= s_lastSpan && frame == s_lastFrame)
+    return s_lastWritten;
+  auto [it, fresh] = s_arrays.try_emplace(plan.match_position_base);
+  ArrayState& state = it->second;
+  if (fresh || state.hashed != frame || plan.match_position_span > state.span) {
+    // The widest span the array's draws have read (draws of one array reach
+    // different lengths, in no fixed order), as far as this draw can read.
+    const uint32_t span = std::min(std::max(plan.match_position_span, state.span),
+                                   std::max(plan.match_position_readable, plan.match_position_span));
+    const uint64_t hash = XXH3_64bits(plan.match_position_data, span);
+    if (fresh || hash != state.hash || span != state.span)
+      state.changed = frame;
+    state.hash = hash;
+    state.span = span;
+    state.hashed = frame;
+  }
+  const bool written = state.changed + 1u >= frame;
+  s_lastBase = plan.match_position_base;
+  s_lastSpan = state.span;
+  s_lastFrame = frame;
+  s_lastWritten = written;
+  if (s_arrays.size() > 65536u)
+    s_arrays.clear(); // bounded; a cleared array counts as written once
+  // DOL_AURORA_INTERP_VERTEX_LOG=1: how many arrays, and of them written, a
+  // second (each array once per game frame).
+  static const bool s_log = [] {
+    const char* env = std::getenv("DOL_AURORA_INTERP_VERTEX_LOG");
+    return env != nullptr && env[0] == '1';
+  }();
+  if (s_log) {
+    static uint64_t s_logFrame = 0, s_seen = 0, s_written = 0;
+    ++s_seen;
+    s_written += written ? 1u : 0u;
+    if (frame >= s_logFrame + 30u) {
+      std::fprintf(stderr, "[interp-vertices] frame=%llu arrays=%llu written=%llu tracked=%zu\n",
+                   static_cast<unsigned long long>(frame), static_cast<unsigned long long>(s_seen),
+                   static_cast<unsigned long long>(s_written), s_arrays.size());
+      s_logFrame = frame;
+      s_seen = s_written = 0;
+    }
+  }
+  return written;
+}
+
+uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw, bool tev, bool pixelRepeats,
+                          bool positionsWritten) {
   InterpHelper* h = g_interpHelper.load(std::memory_order_acquire);
   if (h == nullptr) {
     h = new InterpHelper;
@@ -1298,7 +1372,7 @@ uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw, bool 
   while (head - h->consumed.load(std::memory_order_acquire) >= InterpHelper::Capacity)
     std::this_thread::yield();
   InterpJob& job = h->ring[head % InterpHelper::Capacity];
-  frame_interp::capture_draw(plan, job.input);
+  frame_interp::capture_draw(plan, job.input, positionsWritten);
   if (job.input.positions.empty())
     job.vertices.clear();
   else
@@ -1842,11 +1916,12 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // (as after a cut).
   const bool interpolating = frame_interp::enabled() && !frame_interp::frame_skipped();
   const bool matchHere = interpolating && frame_interp::tracing();
+  const bool positionsWritten = interpolating && frame_interp::may_blend_vertices(plan) && positions_written(plan);
   if (matchHere)
     wait_interp_jobs();
   static frame_interp::DrawInput tracedInput;
   if (matchHere)
-    frame_interp::capture_draw(plan, tracedInput);
+    frame_interp::capture_draw(plan, tracedInput, positionsWritten);
   const gxc::VertexShaderConstants* interpConstants =
       matchHere ? frame_interp::blend_draw(tracedInput, plan.constants, repeatsLast) : nullptr;
   // The helper is idle while a frame is traced, so its areas are ours.
@@ -1924,7 +1999,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     depthPipeline = pipeline_ref(depthConfig);
   }
   const bool ownVertices = plan.draw_tag != 0 || plan.draw_scope_part != 0 ||
-                           (interpolating && frame_interp::blends_vertices(plan));
+                           (interpolating && frame_interp::blends_vertices(plan, positionsWritten));
 
   // The ubershader (gxcore_uber.cpp): a draw whose own pipeline is still
   // compiling is drawn with it, with the same result, rather than left out of
@@ -2067,7 +2142,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         g_interpUniformCache, current_frame_id(), recording_frame_slot(), reinterpret_cast<const uint8_t*>(interpConstants),
         sizeof(*interpConstants), frame_interp::last_blend_repeated());
   else if (interpolating && !matchHere)
-    interpJob = queue_interp_job(plan, repeatsLast, tev, pixelRepeats);
+    interpJob = queue_interp_job(plan, repeatsLast, tev, pixelRepeats, positionsWritten);
 
   const auto indexCount = static_cast<uint32_t>(plan.indices.size());
   if (batch != nullptr) {

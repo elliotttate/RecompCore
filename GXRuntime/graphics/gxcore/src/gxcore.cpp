@@ -684,6 +684,12 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     if (const auto* positions = find_array(draw, 0)) {
       plan.match_position_offset = positions->vertex_offset;
       plan.match_position_size = positions->index_size;
+      plan.match_position_base = positions->base;
+      if (positions->resolved && positions->host_data != nullptr) {
+        plan.match_position_span = std::min(positions->span_size, positions->host_available);
+        plan.match_position_readable = positions->host_available;
+        plan.match_position_data = static_cast<const std::uint8_t*>(positions->host_data);
+      }
     }
   }
 

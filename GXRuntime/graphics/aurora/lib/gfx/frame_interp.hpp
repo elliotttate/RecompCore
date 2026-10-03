@@ -82,9 +82,16 @@ struct DrawInput {
   std::array<float, 2> screenCenter{};
   std::array<float, 2> screenExtent{};
 };
-void capture_draw(const gxruntime::gxcore::DrawPlan& plan, DrawInput& out) noexcept;
+// `positionsWritten`: whether the game wrote an indexed draw's position array
+// this frame or the one before (gxcore_draw's positions_written()). Only such
+// meshes (the sea, cloth, a flag) are blended vertex by vertex; the rest move
+// with their matrices, batched, without the copies that costs.
+void capture_draw(const gxruntime::gxcore::DrawPlan& plan, DrawInput& out, bool positionsWritten = true) noexcept;
+// A draw of the kind that is blended vertex by vertex when its vertices move
+// (its key follows its topology, so it is the same whether or not they do).
+bool may_blend_vertices(const gxruntime::gxcore::DrawPlan& plan) noexcept;
 // These draws need independent vertex ranges in each in-between frame.
-bool blends_vertices(const gxruntime::gxcore::DrawPlan& plan) noexcept;
+bool blends_vertices(const gxruntime::gxcore::DrawPlan& plan, bool positionsWritten = true) noexcept;
 
 // Once per submitted gxcore draw, in draw order, on one thread at a time.
 // Returns the constants the draw uses in the in-between frame, or nullptr

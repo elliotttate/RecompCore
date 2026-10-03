@@ -1358,7 +1358,7 @@ static uint64_t draw_key_of(const gxc::DrawPlan& plan) noexcept {
     }
     return h == 0 ? 1 : h;
   }
-  if (blends_vertices(plan) && plan.match_position_size > 0 && plan.match_position_size <= 2 &&
+  if (may_blend_vertices(plan) && plan.match_position_size > 0 && plan.match_position_size <= 2 &&
       plan.match_position_offset + plan.match_position_size <= plan.match_vertex_stride &&
       plan.match_payload_size == plan.vertex_count * plan.match_vertex_stride) {
     // CPU-deformed indexed meshes retain their vertex correspondence when
@@ -1393,14 +1393,23 @@ static uint64_t draw_key_of(const gxc::DrawPlan& plan) noexcept {
 
 uint64_t draw_key(const gxc::DrawPlan& plan) noexcept { return draw_key_of(plan); }
 
-bool blends_vertices(const gxc::DrawPlan& plan) noexcept {
+bool may_blend_vertices(const gxc::DrawPlan& plan) noexcept {
   const size_t decoded = plan.vertices.size() / gxc::kVertexFloats;
   return decoded > 0 && decoded <= kMaxBlendedVertices && !plan.pipeline.shader.has_pos_mtx_idx &&
          (!plan.match_direct_position || plan.draw_tag != 0 || plan.draw_scope_part != 0 ||
           screen_space_sprite(plan));
 }
 
-void capture_draw(const gxc::DrawPlan& plan, DrawInput& out) noexcept {
+bool blends_vertices(const gxc::DrawPlan& plan, bool positionsWritten) noexcept {
+  // An indexed mesh whose positions stand still from frame to frame (most of
+  // the world's models) is moved by its matrices alone; blending it vertex by
+  // vertex finds nothing to do, but cost its vertices' copies and its batch.
+  // Direct UVs come with the draw, so a mesh with them may animate them alone.
+  return may_blend_vertices(plan) &&
+         (plan.match_direct_position || positionsWritten || plan.match_direct_texcoord_mask != 0);
+}
+
+void capture_draw(const gxc::DrawPlan& plan, DrawInput& out, bool positionsWritten) noexcept {
   out.key = draw_key_of(plan);
   out.usedMatrixRows = used_matrix_rows(plan);
   out.haveSamples = false;
@@ -1461,7 +1470,7 @@ void capture_draw(const gxc::DrawPlan& plan, DrawInput& out) noexcept {
   // meshes (water, cloth, CPU skinning) need each vertex blended: fitting a
   // rigid transform to three samples pulls adjacent strips apart. Matrix-
   // skinned models still interpolate their bones, without a second blend.
-  if (blends_vertices(plan)) {
+  if (blends_vertices(plan, positionsWritten)) {
     out.positions.resize(decoded * 3u);
     for (size_t i = 0; i < decoded; ++i)
       std::memcpy(out.positions.data() + i * 3u,
