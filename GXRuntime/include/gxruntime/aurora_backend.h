@@ -6,6 +6,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -20,6 +21,15 @@ typedef struct AuroraBackendConfig {
     bool info_logging;
     bool graphics_logging;
     bool force_untextured;
+    // Where the window is created, passed to Aurora's windowPosX/windowPosY:
+    // a desktop position or an SDL_WINDOWPOS_* value such as
+    // SDL_WINDOWPOS_CENTERED. Aurora treats a negative coordinate as no
+    // position (SDL_WINDOWPOS_UNDEFINED for both), so a position left of or
+    // above the primary display is not kept. 0 (a config that leaves them
+    // out) keeps the screen's corner, as before. Last, so an initializer
+    // written before they existed keeps its meaning.
+    int32_t window_pos_x;
+    int32_t window_pos_y;
 } AuroraBackendConfig;
 
 bool dol_aurora_initialize(int argc, char** argv,
