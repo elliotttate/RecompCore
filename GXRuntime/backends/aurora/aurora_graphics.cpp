@@ -1036,8 +1036,11 @@ bool submit_stage_enqueue_plan(const gxruntime::gxcore::DrawPlan& plan) {
     auto& source = const_cast<gxruntime::gxcore::DrawPlan&>(plan);
     static_cast<gxruntime::gxcore::DrawPlanFields&>(slot) =
         static_cast<const gxruntime::gxcore::DrawPlanFields&>(plan);
-    slot.vertices.swap(source.vertices);
-    slot.indices.swap(source.indices);
+    // Copied into the slot's own arrays, which keep their capacity (swapped,
+    // the builder's arrays came back too small and were reallocated per draw).
+    (void)source;
+    slot.vertices.assign(plan.vertices.begin(), plan.vertices.end());
+    slot.indices.assign(plan.indices.begin(), plan.indices.end());
     std::memcpy(slot.texgen_row, plan.texgen_row, sizeof slot.texgen_row);
     slot.constants_unresolved = plan.constants_unresolved;
     slot.constants_id = plan.constants_id;
