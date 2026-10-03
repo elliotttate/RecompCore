@@ -2,6 +2,7 @@
 #include "gxruntime/aurora_recomp/retail_gx_frontend.hpp"
 #include "gxruntime/aurora_recomp/retail_gx_frontend_c.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <memory>
@@ -336,6 +337,63 @@ void snapshot_post_tex(DrawTransformSnapshot& out,
   }
 }
 
+// The transform state's copies - into the draw queue here, into the packet in
+// emit_new_packets, into the sink's draw in render_sink.cpp - are skipped when
+// its version is the one already there: most draws repeat the draw before's
+// transform (a model's shapes share its matrices), and each copy is 2.3 KB.
+// DOL_GX_TRANSFORM_VERIFY=1 copies every time and counts any difference from
+// what would have been kept ([gx-transform] lines).
+bool transform_verify() {
+  static const bool verify = [] {
+    const char* env = std::getenv("DOL_GX_TRANSFORM_VERIFY");
+    return env != nullptr && env[0] == '1';
+  }();
+  return verify;
+}
+
+struct TransformReuseCounts {
+  std::uint64_t queued = 0, queued_kept = 0, emitted = 0, emitted_kept = 0, mismatches = 0;
+};
+TransformReuseCounts g_transform_counts;
+
+void note_transform_counts() {
+  if (!transform_verify() || (g_transform_counts.emitted & 0xFFFFFu) != 0u)
+    return;
+  std::fprintf(stderr,
+               "[gx-transform] queue %llu (%llu would keep) packets %llu (%llu would keep) mismatches %llu\n",
+               static_cast<unsigned long long>(g_transform_counts.queued),
+               static_cast<unsigned long long>(g_transform_counts.queued_kept),
+               static_cast<unsigned long long>(g_transform_counts.emitted),
+               static_cast<unsigned long long>(g_transform_counts.emitted_kept),
+               static_cast<unsigned long long>(g_transform_counts.mismatches));
+}
+
+// The arrays of two snapshots differ (the verify mode).
+bool transform_arrays_differ(const DrawTransformSnapshot& a, const DrawTransformSnapshot& b) {
+  if (std::memcmp(a.viewport, b.viewport, sizeof(a.viewport)) != 0 ||
+      std::memcmp(a.projection, b.projection, sizeof(a.projection)) != 0 ||
+      std::memcmp(a.position_matrices, b.position_matrices, sizeof(a.position_matrices)) != 0 ||
+      std::memcmp(a.normal_matrices, b.normal_matrices, sizeof(a.normal_matrices)) != 0 ||
+      std::memcmp(a.normal_matrix_word_mask, b.normal_matrix_word_mask, sizeof(a.normal_matrix_word_mask)) != 0 ||
+      std::memcmp(a.light_words, b.light_words, sizeof(a.light_words)) != 0 ||
+      std::memcmp(a.light_word_mask, b.light_word_mask, sizeof(a.light_word_mask)) != 0 ||
+      std::memcmp(a.chan_regs, b.chan_regs, sizeof(a.chan_regs)) != 0 ||
+      std::memcmp(a.tex_matrices, b.tex_matrices, sizeof(a.tex_matrices)) != 0 ||
+      std::memcmp(a.tex_matrix_word_mask, b.tex_matrix_word_mask, sizeof(a.tex_matrix_word_mask)) != 0 ||
+      std::memcmp(a.xf_regs, b.xf_regs, sizeof(a.xf_regs)) != 0 ||
+      ((a.transform_flags ^ b.transform_flags) & ~kDrawTransformPayloadPnMatrixValid) != 0u ||
+      a.current_pn_matrix != b.current_pn_matrix || a.position_matrix_valid_mask != b.position_matrix_valid_mask ||
+      a.projection_type != b.projection_type || a.chan_reg_mask != b.chan_reg_mask ||
+      a.xf_reg_mask != b.xf_reg_mask || a.post_tex_mask != b.post_tex_mask ||
+      a.post_tex_normalize != b.post_tex_normalize)
+    return true;
+  for (std::uint32_t i = 0; i < 8u; ++i)
+    if ((a.post_tex_mask & (1u << i)) != 0u &&
+        std::memcmp(a.post_tex_rows[i], b.post_tex_rows[i], sizeof(a.post_tex_rows[i])) != 0)
+      return true;
+  return false;
+}
+
 // Fills a queue slot in place. Every field is written (the arrays by a copy or,
 // for an invalid position matrix, a zero of that slot), so a reused slot reads
 // exactly as a value-initialized one would, without zeroing 2.3 KB first and
@@ -394,6 +452,26 @@ void snapshot_transform_into(DrawTransformSnapshot& out,
   snapshot_post_tex(out, state, post);
 }
 
+// A queue slot for a draw whose transform version is the draw before's: its
+// per-draw fields, the arrays left to `previous`'s source slot.
+void snapshot_draw_fields_into(DrawTransformSnapshot& out, const DrawTransformSnapshot& previous,
+                               const DolGxRecompState& state, const DolGxRecompVertexLayout& layout,
+                               std::span<const std::uint8_t> vertex_data, std::uint16_t vertex_count) {
+  out.xf_version = previous.xf_version;
+  out.source = previous.source;
+  out.transform_flags = previous.transform_flags & ~kDrawTransformPayloadPnMatrixValid;
+  out.current_pn_matrix = previous.current_pn_matrix;
+  out.position_matrix_valid_mask = previous.position_matrix_valid_mask;
+  out.projection_type = previous.projection_type;
+  out.chan_reg_mask = previous.chan_reg_mask;
+  out.xf_reg_mask = previous.xf_reg_mask;
+  out.post_tex_mask = previous.post_tex_mask;
+  out.post_tex_normalize = previous.post_tex_normalize;
+  out.payload_pn_matrix_mask = payload_pn_matrix_mask(state, layout, vertex_data, vertex_count);
+  if (out.payload_pn_matrix_mask != 0u)
+    out.transform_flags |= kDrawTransformPayloadPnMatrixValid;
+}
+
 } // namespace
 
 RetailGxFrontend::RetailGxFrontend() { reset(); }
@@ -411,6 +489,7 @@ void RetailGxFrontend::reset(const DolGuestAddressResolver* resolver) {
   draw_queue_count_ = 0u;
   draw_payload_head_ = 0u;
   draw_transform_head_ = 0u;
+  scratch_transform_version_ = 0u;
   zero_vertex_draws_ = 0u;
   emitted_trace_count_ = 0u;
   next_packet_sequence_ = 0u;
@@ -1151,8 +1230,23 @@ bool RetailGxFrontend::handle_draw(std::uint8_t command,
     }
     draw_payload_queue_[draw_queue_count_].assign(vertex_data.begin(),
                                                   vertex_data.end());
-    snapshot_transform_into(draw_transform_queue_[draw_queue_count_], state_,
-                            post_tex_, *layout, vertex_data, vertex_count);
+    DrawTransformSnapshot& slot = draw_transform_queue_[draw_queue_count_];
+    const DrawTransformSnapshot* previous =
+        draw_queue_count_ > 0u ? &draw_transform_queue_[draw_queue_count_ - 1u] : nullptr;
+    const bool keep = previous != nullptr && previous->xf_version != 0u &&
+                      previous->xf_version == dol_gx_recomp_xf_version();
+    if (keep && !transform_verify()) {
+      snapshot_draw_fields_into(slot, *previous, state_, *layout, vertex_data, vertex_count);
+    } else {
+      snapshot_transform_into(slot, state_, post_tex_, *layout, vertex_data, vertex_count);
+      slot.source = static_cast<std::uint32_t>(draw_queue_count_);
+      if (keep) {
+        ++g_transform_counts.queued_kept;
+        if (transform_arrays_differ(slot, draw_transform_queue_[previous->source]))
+          ++g_transform_counts.mismatches;
+      }
+    }
+    ++g_transform_counts.queued;
     ++draw_queue_count_;
   }
 
@@ -1217,6 +1311,7 @@ bool RetailGxFrontend::emit_new_packets(AuroraRenderSink& sink,
         is_draw && draw_transform_head_ < draw_queue_count_;
     if (is_draw && !draw_has_transform) {
       packet.draw = {};
+      scratch_transform_version_ = 0u;
     } else if (is_draw || scratch_draw_dirty_) {
       packet.draw.primitive = 0u;
       packet.draw.vtx_fmt = 0u;
@@ -1241,6 +1336,9 @@ bool RetailGxFrontend::emit_new_packets(AuroraRenderSink& sink,
         draw_transform_head_ < draw_queue_count_) {
       const DrawTransformSnapshot& transform =
           draw_transform_queue_[draw_transform_head_++];
+      // The arrays: in the slot named by source; already in the packet when
+      // the draw before had the same version.
+      const DrawTransformSnapshot& arrays = draw_transform_queue_[transform.source];
       packet.draw.xf_version = transform.xf_version;
       packet.draw.transform_flags = transform.transform_flags;
       packet.draw.current_pn_matrix = transform.current_pn_matrix;
@@ -1248,39 +1346,74 @@ bool RetailGxFrontend::emit_new_packets(AuroraRenderSink& sink,
           transform.payload_pn_matrix_mask;
       packet.draw.position_matrix_valid_mask =
           transform.position_matrix_valid_mask;
-      std::memcpy(packet.draw.viewport, transform.viewport,
-                  sizeof(packet.draw.viewport));
-      std::memcpy(packet.draw.projection, transform.projection,
-                  sizeof(packet.draw.projection));
       packet.draw.projection_type = transform.projection_type;
-      std::memcpy(packet.draw.position_matrices, transform.position_matrices,
-                  sizeof(packet.draw.position_matrices));
-      std::memcpy(packet.draw.normal_matrices, transform.normal_matrices,
-                  sizeof(packet.draw.normal_matrices));
-      std::memcpy(packet.draw.normal_matrix_word_mask,
-                  transform.normal_matrix_word_mask,
-                  sizeof(packet.draw.normal_matrix_word_mask));
-      std::memcpy(packet.draw.light_words, transform.light_words,
-                  sizeof(packet.draw.light_words));
-      std::memcpy(packet.draw.light_word_mask, transform.light_word_mask,
-                  sizeof(packet.draw.light_word_mask));
-      std::memcpy(packet.draw.chan_regs, transform.chan_regs,
-                  sizeof(packet.draw.chan_regs));
       packet.draw.chan_reg_mask = transform.chan_reg_mask;
-      std::memcpy(packet.draw.tex_matrices, transform.tex_matrices,
-                  sizeof(packet.draw.tex_matrices));
-      std::memcpy(packet.draw.tex_matrix_word_mask,
-                  transform.tex_matrix_word_mask,
-                  sizeof(packet.draw.tex_matrix_word_mask));
-      std::memcpy(packet.draw.xf_regs, transform.xf_regs,
-                  sizeof(packet.draw.xf_regs));
       packet.draw.xf_reg_mask = transform.xf_reg_mask;
       packet.draw.post_tex_mask = transform.post_tex_mask;
       packet.draw.post_tex_normalize = transform.post_tex_normalize;
-      for (std::uint32_t i = 0; i < 8u; ++i)
-        if ((transform.post_tex_mask & (1u << i)) != 0u)
-          std::memcpy(packet.draw.post_tex_rows[i], transform.post_tex_rows[i],
-                      sizeof(packet.draw.post_tex_rows[i]));
+      const bool keep = transform.xf_version != 0u &&
+                        transform.xf_version == scratch_transform_version_;
+      ++g_transform_counts.emitted;
+      if (keep && transform_verify()) {
+        ++g_transform_counts.emitted_kept;
+        DrawTransformSnapshot held;
+        std::memcpy(held.viewport, packet.draw.viewport, sizeof(held.viewport));
+        std::memcpy(held.projection, packet.draw.projection, sizeof(held.projection));
+        std::memcpy(held.position_matrices, packet.draw.position_matrices, sizeof(held.position_matrices));
+        std::memcpy(held.normal_matrices, packet.draw.normal_matrices, sizeof(held.normal_matrices));
+        std::memcpy(held.normal_matrix_word_mask, packet.draw.normal_matrix_word_mask,
+                    sizeof(held.normal_matrix_word_mask));
+        std::memcpy(held.light_words, packet.draw.light_words, sizeof(held.light_words));
+        std::memcpy(held.light_word_mask, packet.draw.light_word_mask, sizeof(held.light_word_mask));
+        std::memcpy(held.chan_regs, packet.draw.chan_regs, sizeof(held.chan_regs));
+        std::memcpy(held.tex_matrices, packet.draw.tex_matrices, sizeof(held.tex_matrices));
+        std::memcpy(held.tex_matrix_word_mask, packet.draw.tex_matrix_word_mask,
+                    sizeof(held.tex_matrix_word_mask));
+        std::memcpy(held.xf_regs, packet.draw.xf_regs, sizeof(held.xf_regs));
+        std::memcpy(held.post_tex_rows, packet.draw.post_tex_rows, sizeof(held.post_tex_rows));
+        held.transform_flags = arrays.transform_flags;
+        held.current_pn_matrix = arrays.current_pn_matrix;
+        held.position_matrix_valid_mask = arrays.position_matrix_valid_mask;
+        held.projection_type = arrays.projection_type;
+        held.chan_reg_mask = arrays.chan_reg_mask;
+        held.xf_reg_mask = arrays.xf_reg_mask;
+        held.post_tex_mask = arrays.post_tex_mask;
+        held.post_tex_normalize = arrays.post_tex_normalize;
+        if (transform_arrays_differ(held, arrays))
+          ++g_transform_counts.mismatches;
+      }
+      if (!keep || transform_verify()) {
+        std::memcpy(packet.draw.viewport, arrays.viewport,
+                    sizeof(packet.draw.viewport));
+        std::memcpy(packet.draw.projection, arrays.projection,
+                    sizeof(packet.draw.projection));
+        std::memcpy(packet.draw.position_matrices, arrays.position_matrices,
+                    sizeof(packet.draw.position_matrices));
+        std::memcpy(packet.draw.normal_matrices, arrays.normal_matrices,
+                    sizeof(packet.draw.normal_matrices));
+        std::memcpy(packet.draw.normal_matrix_word_mask,
+                    arrays.normal_matrix_word_mask,
+                    sizeof(packet.draw.normal_matrix_word_mask));
+        std::memcpy(packet.draw.light_words, arrays.light_words,
+                    sizeof(packet.draw.light_words));
+        std::memcpy(packet.draw.light_word_mask, arrays.light_word_mask,
+                    sizeof(packet.draw.light_word_mask));
+        std::memcpy(packet.draw.chan_regs, arrays.chan_regs,
+                    sizeof(packet.draw.chan_regs));
+        std::memcpy(packet.draw.tex_matrices, arrays.tex_matrices,
+                    sizeof(packet.draw.tex_matrices));
+        std::memcpy(packet.draw.tex_matrix_word_mask,
+                    arrays.tex_matrix_word_mask,
+                    sizeof(packet.draw.tex_matrix_word_mask));
+        std::memcpy(packet.draw.xf_regs, arrays.xf_regs,
+                    sizeof(packet.draw.xf_regs));
+        for (std::uint32_t i = 0; i < 8u; ++i)
+          if ((arrays.post_tex_mask & (1u << i)) != 0u)
+            std::memcpy(packet.draw.post_tex_rows[i], arrays.post_tex_rows[i],
+                        sizeof(packet.draw.post_tex_rows[i]));
+      }
+      scratch_transform_version_ = transform.xf_version;
+      note_transform_counts();
     }
     if (!sink.submit_packet(packet))
       return false;

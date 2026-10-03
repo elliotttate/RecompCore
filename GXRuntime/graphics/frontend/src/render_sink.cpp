@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "gxruntime/aurora_recomp/render_sink.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 namespace gxruntime::aurora_recomp {
@@ -207,8 +209,13 @@ bool ConsumingAuroraRenderSink::submit_packet(const RenderPacket& packet) {
     // and malloc/free in the simulator sample). Every field below is the same
     // value the local copy carried.
     ConsumedDraw* slot;
+    // The retained draw already holds this draw's transform arrays when the
+    // version is the one it was built with (retail_gx_frontend.cpp: most draws
+    // repeat the draw before's transform; 2.3 KB a copy).
+    bool keep_transform = false;
     if (streaming_ && draws_.size() == 1u) {
       slot = &draws_[0];
+      keep_transform = packet.draw.xf_version != 0u && slot->xf_version == packet.draw.xf_version;
       // Every other field is assigned below, and arrays[] entries are fully
       // written when a span appends them, so resetting the count and the
       // payload is the whole reset (a value-initialize here zeroed 3.7 KB per
@@ -236,36 +243,70 @@ bool ConsumingAuroraRenderSink::submit_packet(const RenderPacket& packet) {
     draw.current_pn_matrix = packet.draw.current_pn_matrix;
     draw.payload_pn_matrix_mask = packet.draw.payload_pn_matrix_mask;
     draw.position_matrix_valid_mask = packet.draw.position_matrix_valid_mask;
-    std::memcpy(draw.viewport, packet.draw.viewport, sizeof(draw.viewport));
-    std::memcpy(draw.projection, packet.draw.projection,
-                sizeof(draw.projection));
     draw.projection_type = packet.draw.projection_type;
-    std::memcpy(draw.position_matrices, packet.draw.position_matrices,
-                sizeof(draw.position_matrices));
-    std::memcpy(draw.normal_matrices, packet.draw.normal_matrices,
-                sizeof(draw.normal_matrices));
-    std::memcpy(draw.normal_matrix_word_mask,
-                packet.draw.normal_matrix_word_mask,
-                sizeof(draw.normal_matrix_word_mask));
-    std::memcpy(draw.light_words, packet.draw.light_words,
-                sizeof(draw.light_words));
-    std::memcpy(draw.light_word_mask, packet.draw.light_word_mask,
-                sizeof(draw.light_word_mask));
-    std::memcpy(draw.chan_regs, packet.draw.chan_regs,
-                sizeof(draw.chan_regs));
     draw.chan_reg_mask = packet.draw.chan_reg_mask;
-    std::memcpy(draw.tex_matrices, packet.draw.tex_matrices,
-                sizeof(draw.tex_matrices));
-    std::memcpy(draw.tex_matrix_word_mask, packet.draw.tex_matrix_word_mask,
-                sizeof(draw.tex_matrix_word_mask));
-    std::memcpy(draw.xf_regs, packet.draw.xf_regs, sizeof(draw.xf_regs));
     draw.xf_reg_mask = packet.draw.xf_reg_mask;
     draw.post_tex_mask = packet.draw.post_tex_mask;
     draw.post_tex_normalize = packet.draw.post_tex_normalize;
-    for (std::uint32_t i = 0; i < 8u; ++i)
-      if ((draw.post_tex_mask & (1u << i)) != 0u)
-        std::memcpy(draw.post_tex_rows[i], packet.draw.post_tex_rows[i],
-                    sizeof(draw.post_tex_rows[i]));
+    static const bool verify = [] {
+      const char* env = std::getenv("DOL_GX_TRANSFORM_VERIFY");
+      return env != nullptr && env[0] == '1';
+    }();
+    if (keep_transform && verify) {
+      static unsigned long long kept = 0, differed = 0;
+      ++kept;
+      bool same = std::memcmp(draw.viewport, packet.draw.viewport, sizeof(draw.viewport)) == 0 &&
+                  std::memcmp(draw.projection, packet.draw.projection, sizeof(draw.projection)) == 0 &&
+                  std::memcmp(draw.position_matrices, packet.draw.position_matrices,
+                              sizeof(draw.position_matrices)) == 0 &&
+                  std::memcmp(draw.normal_matrices, packet.draw.normal_matrices, sizeof(draw.normal_matrices)) == 0 &&
+                  std::memcmp(draw.normal_matrix_word_mask, packet.draw.normal_matrix_word_mask,
+                              sizeof(draw.normal_matrix_word_mask)) == 0 &&
+                  std::memcmp(draw.light_words, packet.draw.light_words, sizeof(draw.light_words)) == 0 &&
+                  std::memcmp(draw.light_word_mask, packet.draw.light_word_mask, sizeof(draw.light_word_mask)) == 0 &&
+                  std::memcmp(draw.chan_regs, packet.draw.chan_regs, sizeof(draw.chan_regs)) == 0 &&
+                  std::memcmp(draw.tex_matrices, packet.draw.tex_matrices, sizeof(draw.tex_matrices)) == 0 &&
+                  std::memcmp(draw.tex_matrix_word_mask, packet.draw.tex_matrix_word_mask,
+                              sizeof(draw.tex_matrix_word_mask)) == 0 &&
+                  std::memcmp(draw.xf_regs, packet.draw.xf_regs, sizeof(draw.xf_regs)) == 0;
+      for (std::uint32_t i = 0; i < 8u && same; ++i)
+        if ((draw.post_tex_mask & (1u << i)) != 0u)
+          same = std::memcmp(draw.post_tex_rows[i], packet.draw.post_tex_rows[i], sizeof(draw.post_tex_rows[i])) == 0;
+      if (!same)
+        ++differed;
+      if ((kept & 0xFFFFFu) == 0u)
+        std::fprintf(stderr, "[gx-transform] sink: %llu draws would keep their transform, %llu differ\n", kept,
+                     differed);
+    }
+    if (!keep_transform || verify) {
+      std::memcpy(draw.viewport, packet.draw.viewport, sizeof(draw.viewport));
+      std::memcpy(draw.projection, packet.draw.projection,
+                  sizeof(draw.projection));
+      draw.projection_type = packet.draw.projection_type;
+      std::memcpy(draw.position_matrices, packet.draw.position_matrices,
+                  sizeof(draw.position_matrices));
+      std::memcpy(draw.normal_matrices, packet.draw.normal_matrices,
+                  sizeof(draw.normal_matrices));
+      std::memcpy(draw.normal_matrix_word_mask,
+                  packet.draw.normal_matrix_word_mask,
+                  sizeof(draw.normal_matrix_word_mask));
+      std::memcpy(draw.light_words, packet.draw.light_words,
+                  sizeof(draw.light_words));
+      std::memcpy(draw.light_word_mask, packet.draw.light_word_mask,
+                  sizeof(draw.light_word_mask));
+      std::memcpy(draw.chan_regs, packet.draw.chan_regs,
+                  sizeof(draw.chan_regs));
+      draw.chan_reg_mask = packet.draw.chan_reg_mask;
+      std::memcpy(draw.tex_matrices, packet.draw.tex_matrices,
+                  sizeof(draw.tex_matrices));
+      std::memcpy(draw.tex_matrix_word_mask, packet.draw.tex_matrix_word_mask,
+                  sizeof(draw.tex_matrix_word_mask));
+      std::memcpy(draw.xf_regs, packet.draw.xf_regs, sizeof(draw.xf_regs));
+      for (std::uint32_t i = 0; i < 8u; ++i)
+        if ((draw.post_tex_mask & (1u << i)) != 0u)
+          std::memcpy(draw.post_tex_rows[i], packet.draw.post_tex_rows[i],
+                      sizeof(draw.post_tex_rows[i]));
+    }
     back_assembled_ = false; // the just-placed draw is not yet assembled
     // Retain the draw's raw per-vertex bytes (valid only during this call) so an
     // issuing sink can assemble vertices after submit.

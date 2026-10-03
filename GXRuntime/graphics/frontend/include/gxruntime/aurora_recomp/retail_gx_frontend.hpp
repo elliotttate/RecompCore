@@ -18,6 +18,10 @@ namespace gxruntime::aurora_recomp {
 struct DrawTransformSnapshot {
   // dol_gx_recomp_xf_version() at the draw: the same number, the same state.
   std::uint64_t xf_version = 0;
+  // The queue slot whose arrays hold this draw's transform state: its own, or,
+  // when the version is the draw before's, that draw's source (only the
+  // per-draw fields are written then).
+  std::uint32_t source = 0;
   std::uint32_t transform_flags = 0;
   std::uint32_t current_pn_matrix = 0;
   std::uint32_t payload_pn_matrix_mask = 0;
@@ -175,6 +179,8 @@ private:
   std::size_t draw_queue_count_ = 0; // live slots; the vectors keep capacity
   std::size_t draw_payload_head_ = 0;
   std::size_t draw_transform_head_ = 0;
+  // The transform version whose arrays scratch_packet_.draw holds (0: none).
+  std::uint64_t scratch_transform_version_ = 0;
   void notify_events(std::uint32_t first_event);
 
   bool packet_drain_enabled_ = false;
