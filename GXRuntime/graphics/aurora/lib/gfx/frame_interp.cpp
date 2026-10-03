@@ -1301,7 +1301,7 @@ static uint64_t draw_key_of(const gxc::DrawPlan& plan) noexcept {
     return h == 0 ? 1 : h;
   }
   if (plan.match_direct_position && plan.draw_tag == 0 && plan.match_primitive == 0x90 && plan.tex_address != 0 &&
-      plan.constants.projection[3][2] != 0.f) {
+      plan.vertex_constants().projection[3][2] != 0.f) {
     // A textured list of triangles in the scene: a real shadow cast onto the
     // triangles of the ground or sea under its object, in its own texture.
     // As many as lie there: a different count every few frames as the boat

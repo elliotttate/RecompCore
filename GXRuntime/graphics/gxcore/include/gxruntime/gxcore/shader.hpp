@@ -541,6 +541,11 @@ struct DrawPlanFields {
   PlanTexture textures[8]{};
   // Diagnostics: MatrixIndexA as captured.
   std::uint32_t matrix_index_a = 0;
+  // Where the draw's vertex constants are when they are not in the plan
+  // itself: a plan handed to another thread carries its constants only when
+  // they changed, and the receiver points the plans that follow at its copy.
+  // Null (the builder's default): `constants` below.
+  const VertexShaderConstants* constants_override = nullptr;
 };
 
 struct DrawPlan : DrawPlanFields {
@@ -556,6 +561,11 @@ struct DrawPlan : DrawPlanFields {
   std::uint64_t constants_id = 0;
   std::vector<float> vertices; // kVertexFloats per vertex
   std::vector<std::uint16_t> indices;
+
+  // The draw's vertex constants (see constants_override).
+  const VertexShaderConstants& vertex_constants() const noexcept {
+    return constants_override != nullptr ? *constants_override : constants;
+  }
 };
 
 // --- EFB copy-to-texture (S16) ------------------------------------------------

@@ -11,6 +11,7 @@ enum class Role : uint32_t {
   GxWorker,     // the GX FIFO translation worker
   InterpHelper, // Smooth Motion's matching and blending
   RenderWorker, // Aurora's encoding and presenting
+  GxSubmit,     // the GX worker's second stage: the draw plans into Aurora
   Count,
 };
 

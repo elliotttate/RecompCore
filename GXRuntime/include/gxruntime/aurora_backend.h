@@ -75,6 +75,9 @@ typedef struct DolAuroraFrameTiming {
     unsigned long long gx_worker_cpu_us;
     unsigned long long interp_helper_cpu_us;
     unsigned long long render_worker_cpu_us;
+    /* The GX worker's second stage (the draw plans into Aurora), when it runs
+       on a thread of its own; 0 otherwise. */
+    unsigned long long gx_submit_cpu_us;
 } DolAuroraFrameTiming;
 void dol_aurora_frame_timing(DolAuroraFrameTiming* out);
 

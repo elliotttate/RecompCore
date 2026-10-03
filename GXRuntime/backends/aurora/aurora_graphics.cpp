@@ -58,9 +58,11 @@ bool core_texture_dirty_epoch(uint32_t address, uint32_t size,
     return dol_guest_memory_dirty_epoch(address, size, epoch);
 }
 
-void core_plan_observer(const gxruntime::gxcore::DrawPlan& plan, void*) {
-    if (!plan.ok)
-        return; // skip reasons are tallied in the sink gap counters
+bool submit_stage_enqueue_plan(const gxruntime::gxcore::DrawPlan& plan);
+bool submit_stage_enqueue_copy(const gxruntime::gxcore::EfbCopyCommand& cmd);
+
+// A draw plan into Aurora, on the thread that built it or on the submit stage's.
+void core_submit_plan(const gxruntime::gxcore::DrawPlan& plan) {
     // DOL_GXCORE_PLAN_TEX=<hex guest address>: print the TEV setup of draws
     // that sample that texture (first 12), for comparing a draw with Dolphin.
     static const long long s_plan_tex = [] {
@@ -112,7 +114,7 @@ void core_plan_observer(const gxruntime::gxcore::DrawPlan& plan, void*) {
                 std::fprintf(stderr, "[plan-tex]   v%u pos=%.1f,%.1f,%.1f col0=%.3f,%.3f,%.3f,%.3f\n", v, p[0], p[1], p[2], p[4], p[5], p[6], p[7]);
             }
         }
-        const auto& vc = plan.constants;
+        const auto& vc = plan.vertex_constants();
         std::fprintf(stderr, " mat0=%d,%d,%d,%d amb0=%d,%d,%d,%d\n",
                      vc.materials[2][0], vc.materials[2][1], vc.materials[2][2], vc.materials[2][3],
                      vc.materials[0][0], vc.materials[0][1], vc.materials[0][2], vc.materials[0][3]);
@@ -131,10 +133,22 @@ void core_plan_observer(const gxruntime::gxcore::DrawPlan& plan, void*) {
         ++g_core_rejected;
 }
 
-void core_copy_observer(const gxruntime::gxcore::EfbCopyCommand& cmd, void*) {
+void core_plan_observer(const gxruntime::gxcore::DrawPlan& plan, void*) {
+    if (!plan.ok)
+        return; // skip reasons are tallied in the sink gap counters
+    if (!submit_stage_enqueue_plan(plan))
+        core_submit_plan(plan);
+}
+
+void core_run_copy(const gxruntime::gxcore::EfbCopyCommand& cmd) {
     aurora::gfx::gxcore::copy_efb_to_texture(cmd);
     if (cmd.format == 0xFu && !g_worker_mode.load(std::memory_order_relaxed))
         g_display_copy_pending = true;
+}
+
+void core_copy_observer(const gxruntime::gxcore::EfbCopyCommand& cmd, void*) {
+    if (!submit_stage_enqueue_copy(cmd))
+        core_run_copy(cmd);
 }
 #endif
 
@@ -420,6 +434,174 @@ bool g_worker_waiting_present = false;  // under g_fifo_worker_mutex
 std::uint64_t g_present_wait_seen = 0;  // g_presents_done when the wait began
 void wait_for_present(std::unique_lock<std::mutex>& recording);
 
+// The GX worker's second stage. The worker parses the FIFO and builds each
+// draw's plan (the front end and gxcore); putting the plans into Aurora - the
+// staging buffers, pipelines, textures and bind groups, Smooth Motion's
+// capture - was the other third of its time, on the same thread. With a
+// second thread that part runs beside the parse: the worker queues each plan
+// and each EFB copy, in order, on a ring the submit thread empties. A plan's
+// vertex and index arrays change hands without a copy, its vertex constants
+// travel only when they changed (most draws repeat the draw before's: the
+// submit thread keeps the current ones), and the bytes Smooth Motion matches
+// on are copied, as the sink reuses them for the next draw.
+//
+// What the guest sees does not change: the draw-done barrier waits until the
+// submit thread has run every op of the batches it waits for (the worker
+// queues a marker at each batch's end, and the submit thread is the one that
+// moves g_fifo_parsed), so nothing reads guest memory for those draws after
+// the guest goes on; and a display copy's present waits until the queue is
+// empty, so every draw lands in the frame it belongs to. The submit thread
+// records under the recording lock while it has ops, and drops (and counts)
+// what arrives when no frame is open.
+//
+// DOL_GX_SUBMIT_THREAD=0 keeps one thread, =1 forces two; by default two on a
+// CPU with 6 logical processors or more (on four, the game, the worker, the
+// render worker and Smooth Motion's helper already have one each).
+constexpr std::uint64_t kSubmitRing = 512;
+enum class SubmitKind : std::uint8_t { Draw, Copy, BatchDone };
+struct SubmitOp {
+    SubmitKind kind = SubmitKind::Draw;
+    bool carries_constants = false;
+    std::uint64_t parsed = 0;
+    gxruntime::gxcore::EfbCopyCommand copy{};
+};
+SubmitOp g_submit_ops[kSubmitRing];
+gxruntime::gxcore::DrawPlan g_submit_plans[kSubmitRing];
+std::vector<std::uint8_t> g_submit_payloads[kSubmitRing];
+std::atomic<std::uint64_t> g_submit_head{0}; // written by the worker
+std::atomic<std::uint64_t> g_submit_tail{0}; // written by the submit thread
+std::mutex g_submit_mutex;
+std::condition_variable g_submit_cv;       // wakes the submit thread
+std::condition_variable g_submit_space_cv; // wakes the worker (room, or empty)
+std::atomic<bool> g_submit_sleeping{false};
+std::atomic<bool> g_submit_waiter{false};
+std::atomic<bool> g_submit_stop{false};
+std::thread g_submit_thread;
+bool g_submit_active = false;
+std::uint64_t g_submit_constants_id = 0; // worker: the last constants queued
+gxruntime::gxcore::VertexShaderConstants g_submit_constants{}; // submit thread
+std::atomic<std::uint64_t> g_submit_dropped{0};
+thread_local bool t_on_gx_worker = false;
+
+bool submit_stage_wanted() {
+    static const bool wanted = [] {
+        const char* env = std::getenv("DOL_GX_SUBMIT_THREAD");
+        if (env != nullptr && env[0] != '\0')
+            return env[0] != '0';
+        return std::thread::hardware_concurrency() >= 6u;
+    }();
+    return wanted;
+}
+
+// Worker: the index of the next op, once the ring has room for it.
+std::uint64_t submit_reserve() {
+    const std::uint64_t head = g_submit_head.load(std::memory_order_relaxed);
+    if (head - g_submit_tail.load(std::memory_order_acquire) >= kSubmitRing) {
+        std::unique_lock<std::mutex> lock(g_submit_mutex);
+        g_submit_waiter.store(true, std::memory_order_seq_cst);
+        g_submit_space_cv.wait(lock, [head] {
+            return head - g_submit_tail.load(std::memory_order_seq_cst) < kSubmitRing;
+        });
+        g_submit_waiter.store(false, std::memory_order_relaxed);
+    }
+    return head;
+}
+
+void submit_publish(std::uint64_t index) {
+    g_submit_head.store(index + 1u, std::memory_order_seq_cst);
+    if (g_submit_sleeping.load(std::memory_order_seq_cst)) {
+        std::lock_guard<std::mutex> lock(g_submit_mutex);
+        g_submit_cv.notify_one();
+    }
+}
+
+// Worker: waits until the submit thread has run everything queued.
+void submit_wait_empty() {
+    const std::uint64_t head = g_submit_head.load(std::memory_order_relaxed);
+    if (g_submit_tail.load(std::memory_order_acquire) == head)
+        return;
+    std::unique_lock<std::mutex> lock(g_submit_mutex);
+    g_submit_waiter.store(true, std::memory_order_seq_cst);
+    g_submit_space_cv.wait(lock, [head] { return g_submit_tail.load(std::memory_order_seq_cst) == head; });
+    g_submit_waiter.store(false, std::memory_order_relaxed);
+}
+
+void submit_batch_done(std::uint64_t parsed) {
+    const std::uint64_t index = submit_reserve();
+    SubmitOp& op = g_submit_ops[index % kSubmitRing];
+    op.kind = SubmitKind::BatchDone;
+    op.parsed = parsed;
+    submit_publish(index);
+}
+
+void submit_main() {
+    aurora::gfx::thread_cpu::register_current(aurora::gfx::thread_cpu::Role::GxSubmit);
+    std::unique_lock<std::mutex> recording(g_aurora_recording_mutex, std::defer_lock);
+    std::uint64_t tail = g_submit_tail.load(std::memory_order_relaxed);
+    for (;;) {
+        if (g_submit_head.load(std::memory_order_acquire) == tail) {
+            // Nothing queued: let the main thread have the frame, then wait
+            // (a few yields first - the next draw is usually microseconds off).
+            if (recording.owns_lock())
+                recording.unlock();
+            bool more = false;
+            for (int spin = 0; spin < 64 && !more; ++spin) {
+                std::this_thread::yield();
+                more = g_submit_head.load(std::memory_order_acquire) != tail;
+            }
+            if (!more) {
+                std::unique_lock<std::mutex> lock(g_submit_mutex);
+                g_submit_sleeping.store(true, std::memory_order_seq_cst);
+                g_submit_cv.wait(lock, [tail] {
+                    return g_submit_head.load(std::memory_order_seq_cst) != tail ||
+                           g_submit_stop.load(std::memory_order_seq_cst);
+                });
+                g_submit_sleeping.store(false, std::memory_order_relaxed);
+                if (g_submit_head.load(std::memory_order_acquire) == tail)
+                    return; // stopped, with nothing left
+            }
+            continue;
+        }
+        if (!recording.owns_lock())
+            recording.lock();
+        const std::uint32_t i = static_cast<std::uint32_t>(tail % kSubmitRing);
+        SubmitOp& op = g_submit_ops[i];
+        switch (op.kind) {
+        case SubmitKind::Draw: {
+            gxruntime::gxcore::DrawPlan& plan = g_submit_plans[i];
+            if (op.carries_constants)
+                std::memcpy(&g_submit_constants, &plan.constants, sizeof g_submit_constants);
+            plan.constants_override = &g_submit_constants;
+            if (g_aurora_recording_open)
+                core_submit_plan(plan);
+            else
+                g_submit_dropped.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+        case SubmitKind::Copy:
+            if (g_aurora_recording_open)
+                core_run_copy(op.copy);
+            else
+                g_submit_dropped.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case SubmitKind::BatchDone:
+            // Lock order: recording, then the worker's.
+            {
+                std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
+                g_fifo_parsed = op.parsed;
+            }
+            g_fifo_worker_idle_cv.notify_all();
+            break;
+        }
+        ++tail;
+        g_submit_tail.store(tail, std::memory_order_seq_cst);
+        if (g_submit_waiter.load(std::memory_order_seq_cst)) {
+            std::lock_guard<std::mutex> lock(g_submit_mutex);
+            g_submit_space_cv.notify_all();
+        }
+    }
+}
+
 void g_fifo_translate(std::vector<std::uint8_t>& batch) {
     if (batch.empty())
         return;
@@ -431,6 +613,11 @@ void g_fifo_translate(std::vector<std::uint8_t>& batch) {
     bool record_into_aurora = g_gx_core_enabled && g_aurora_recording_open;
     if (g_gx_core_enabled && !record_into_aurora)
         g_aurora_unframed_batches.fetch_add(1, std::memory_order_relaxed);
+    // With the submit stage, the parse only queues: the submit thread records,
+    // under the lock, and this thread takes it only for a present.
+    const bool staged = g_submit_active;
+    if (staged)
+        recording.unlock();
     // Feed the front end in the slices the single-threaded path flushes at.
     // Its per-flush event trace holds DOL_GX_RECOMP_MAX_TRACE_EVENTS (8,192)
     // events and silently drops the rest, so one heavy batch (60 KB measured in
@@ -452,8 +639,15 @@ void g_fifo_translate(std::vector<std::uint8_t>& batch) {
         // A parse that stopped at a display copy resumes on the buffered rest
         // only after the present, and may stop again at the next one.
         while (flushed && g_shadow_frontend.display_copy_stopped()) {
+            if (staged) {
+                // Every draw before the copy into the frame being presented.
+                submit_wait_empty();
+                recording.lock();
+            }
             wait_for_present(recording);
             record_into_aurora = g_gx_core_enabled && g_aurora_recording_open;
+            if (staged)
+                recording.unlock();
             flushed = record_into_aurora ? g_shadow_frontend.flush(&g_core_sink)
                                          : g_shadow_frontend.flush(&g_shadow_packet_sink);
         }
@@ -561,6 +755,7 @@ void g_fifo_worker_main() {
 #endif
     start_stall_watchdog();
     aurora::gfx::thread_cpu::register_current(aurora::gfx::thread_cpu::Role::GxWorker);
+    t_on_gx_worker = true;
     // Kept across batches: the swap below hands its capacity back to the
     // handoff, so the game thread's appends reuse it instead of growing a new
     // vector (and this thread freeing the old one) every batch.
@@ -614,10 +809,15 @@ void g_fifo_worker_main() {
         }
         {
             std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
-            g_fifo_parsed = parsed;
+            // With the submit stage, the batch counts as translated when the
+            // submit thread reaches its marker (submit_main).
+            if (!g_submit_active)
+                g_fifo_parsed = parsed;
             if (!g_fifo_work_pending)
                 g_fifo_worker_idle = true;
         }
+        if (g_submit_active)
+            submit_batch_done(parsed);
         g_fifo_worker_idle_cv.notify_all();
     }
 }
@@ -655,6 +855,12 @@ void g_fifo_worker_start() {
         return;
     g_fifo_worker_started = true;
     g_worker_mode = true;
+    if (submit_stage_wanted()) {
+        g_submit_stop = false;
+        g_submit_active = true;
+        g_submit_thread = std::thread(submit_main);
+        std::fprintf(stderr, "[gx] the GX worker in two stages: draws into Aurora on a thread of their own\n");
+    }
     g_fifo_worker_thread = std::thread(g_fifo_worker_main);
 }
 
@@ -685,6 +891,19 @@ void g_fifo_worker_stop_and_join() {
     g_present_cv.notify_all();
     if (worker.joinable())
         worker.join();
+    // The submit thread runs what the worker queued, then stops.
+    if (g_submit_thread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(g_submit_mutex);
+            g_submit_stop.store(true, std::memory_order_seq_cst);
+            g_submit_cv.notify_all();
+        }
+        g_submit_thread.join();
+        g_submit_active = false;
+        if (const auto dropped = g_submit_dropped.load(std::memory_order_relaxed))
+            std::fprintf(stderr, "[gx] submit stage: %llu ops arrived with no frame open\n",
+                         static_cast<unsigned long long>(dropped));
+    }
     std::lock_guard<std::mutex> lock(g_fifo_worker_mutex);
     // A later initialization may start the worker again.
     g_fifo_worker_stop = false;
@@ -804,6 +1023,49 @@ static void g_fifo_drain_impl() {
 }
 
 }  // namespace
+
+bool submit_stage_enqueue_plan(const gxruntime::gxcore::DrawPlan& plan) {
+    if (!g_submit_active || !t_on_gx_worker)
+        return false;
+    const std::uint64_t index = submit_reserve();
+    const std::uint32_t i = static_cast<std::uint32_t>(index % kSubmitRing);
+    SubmitOp& op = g_submit_ops[i];
+    gxruntime::gxcore::DrawPlan& slot = g_submit_plans[i];
+    // The builder's plan is rebuilt from scratch for the next draw (its
+    // arrays cleared and refilled), so its arrays can be swapped out.
+    auto& source = const_cast<gxruntime::gxcore::DrawPlan&>(plan);
+    static_cast<gxruntime::gxcore::DrawPlanFields&>(slot) =
+        static_cast<const gxruntime::gxcore::DrawPlanFields&>(plan);
+    slot.vertices.swap(source.vertices);
+    slot.indices.swap(source.indices);
+    std::memcpy(slot.texgen_row, plan.texgen_row, sizeof slot.texgen_row);
+    slot.constants_unresolved = plan.constants_unresolved;
+    slot.constants_id = plan.constants_id;
+    op.carries_constants = plan.constants_id == 0u || plan.constants_id != g_submit_constants_id;
+    if (op.carries_constants) {
+        slot.constants = plan.constants;
+        g_submit_constants_id = plan.constants_id;
+    }
+    if (plan.match_payload != nullptr && plan.match_payload_size != 0u) {
+        std::vector<std::uint8_t>& payload = g_submit_payloads[i];
+        payload.assign(plan.match_payload, plan.match_payload + plan.match_payload_size);
+        slot.match_payload = payload.data();
+    }
+    op.kind = SubmitKind::Draw;
+    submit_publish(index);
+    return true;
+}
+
+bool submit_stage_enqueue_copy(const gxruntime::gxcore::EfbCopyCommand& cmd) {
+    if (!g_submit_active || !t_on_gx_worker)
+        return false;
+    const std::uint64_t index = submit_reserve();
+    SubmitOp& op = g_submit_ops[index % kSubmitRing];
+    op.kind = SubmitKind::Copy;
+    op.copy = cmd;
+    submit_publish(index);
+    return true;
+}
 
 void shadow_frontend_set_array(u32 attr, u32 guest_address, u8 stride) {
     if (!g_shadow_frontend_enabled || g_shadow_frontend_failed)
@@ -1341,6 +1603,7 @@ void dol_aurora_frame_timing(DolAuroraFrameTiming* out) {
         out->gx_worker_cpu_us = aurora::gfx::thread_cpu::cpu_us(Role::GxWorker);
         out->interp_helper_cpu_us = aurora::gfx::thread_cpu::cpu_us(Role::InterpHelper);
         out->render_worker_cpu_us = aurora::gfx::thread_cpu::cpu_us(Role::RenderWorker);
+        out->gx_submit_cpu_us = aurora::gfx::thread_cpu::cpu_us(Role::GxSubmit);
     }
     out->audio_queued_ms = 0;
     if (gx_aurora::g_audio_stream != nullptr && gx_aurora::g_audio_sample_rate != 0u) {

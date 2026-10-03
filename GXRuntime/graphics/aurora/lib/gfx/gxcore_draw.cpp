@@ -1283,7 +1283,7 @@ uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw, bool 
   // of a packet carries its own.
   job.constantsCopied = !repeatsLastDraw || h->jobs == 0u;
   if (job.constantsCopied)
-    std::memcpy(&job.constants, &plan.constants, sizeof(plan.constants));
+    std::memcpy(&job.constants, &plan.vertex_constants(), sizeof(job.constants));
   // pixelRepeats: the pixel constants are those last pushed in this frame
   // packet, which the last TEV job before this one carried (or repeated).
   job.tev = tev;
@@ -1367,7 +1367,7 @@ static void dump_draw(const gxc::DrawPlan& plan) {
   static uint32_t index = 0;
   const auto& key = plan.pipeline;
   const auto& sh = key.shader;
-  const auto& m = plan.constants.posnormalmatrix;
+  const auto& m = plan.vertex_constants().posnormalmatrix;
   std::fprintf(stderr,
                "[draw-dump] #%u verts=%u prim=0x%02X t=(%.0f,%.0f,%.0f) blend=%u src=%u dst=%u z=%u/%u/%u tev=%u "
                "stages=%u ind=%u texgens=%u chans=%u lit=%u alpha=%u/%u/%u fog=%u tag=%06X\n",
@@ -1394,7 +1394,7 @@ static void dump_draw(const gxc::DrawPlan& plan) {
                  sh.tex_gens[i].texgentype, sh.tex_gens[i].sourcerow, sh.tex_gens[i].inputform,
                  sh.tex_gens[i].projection, plan.texgen_row[i], plan.matrix_index_a);
     for (uint32_t r = 0; r < 3u; ++r) {
-      const float* row = plan.constants.texmatrices[i * 3u + r];
+      const float* row = plan.vertex_constants().texmatrices[i * 3u + r];
       std::fprintf(stderr, "[draw-dump]     tm%u.%u %.4f %.4f %.4f %.4f\n", i, r, row[0], row[1], row[2], row[3]);
     }
   }
@@ -1802,8 +1802,8 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   const uint64_t frameId = current_frame_id();
   const bool repeatsLast =
       (plan.constants_id != 0 && frameId != 0 && plan.constants_id == g_pushedConstantsId &&
-       g_vertexUniformCache.frameId == frameId && g_vertexUniformCache.range.size == sizeof(plan.constants)) ||
-      repeats_cached(g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants), sizeof(plan.constants));
+       g_vertexUniformCache.frameId == frameId && g_vertexUniformCache.range.size == sizeof(gxc::VertexShaderConstants)) ||
+      repeats_cached(g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.vertex_constants()), sizeof(gxc::VertexShaderConstants));
   // In-between frames: matched on the helper thread (queued below), or here
   // while a traced frame reports each draw's outcome. Here it is matched
   // before a staging segment can split the frame; a split frame is not
@@ -1819,7 +1819,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   if (matchHere)
     frame_interp::capture_draw(plan, tracedInput);
   const gxc::VertexShaderConstants* interpConstants =
-      matchHere ? frame_interp::blend_draw(tracedInput, plan.constants, repeatsLast) : nullptr;
+      matchHere ? frame_interp::blend_draw(tracedInput, plan.vertex_constants(), repeatsLast) : nullptr;
   // The helper is idle while a frame is traced, so its areas are ours.
   static std::vector<float> tracedVertices;
   const float* tracedPositions = matchHere ? frame_interp::blended_positions() : nullptr;
@@ -1828,7 +1828,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
           ? push_blended_vertices(recording_frame_slot(), plan.vertices, tracedPositions, tracedVertices)
           : Range{};
   if (frame_interp::tracing()) {
-    const auto& m = plan.constants.posnormalmatrix;
+    const auto& m = plan.vertex_constants().posnormalmatrix;
     std::fprintf(stderr,
                  "[frame-interp-trace] frame=%llu %s key=%016llx prim=0x%02X fmt=%u verts=%u payload=%u idx=%d "
                  "t=(%.1f,%.1f,%.1f) s=%.3f proj00=%.3f proj32=%.1f tex=%08X bt=(%.1f,%.1f,%.1f) bt0=(%.1f,%.1f,%.1f) "
@@ -1837,30 +1837,30 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                  static_cast<unsigned long long>(frame_interp::draw_key(plan)),
                  plan.match_primitive, plan.match_vtx_fmt, plan.vertex_count, plan.match_payload_size,
                  plan.pipeline.shader.has_pos_mtx_idx, m[0][3], m[1][3], m[2][3],
-                 std::sqrt(m[0][0] * m[0][0] + m[1][0] * m[1][0] + m[2][0] * m[2][0]), plan.constants.projection[0][0],
-                 plan.constants.projection[3][2], plan.tex_address,
+                 std::sqrt(m[0][0] * m[0][0] + m[1][0] * m[1][0] + m[2][0] * m[2][0]), plan.vertex_constants().projection[0][0],
+                 plan.vertex_constants().projection[3][2], plan.tex_address,
                  interpConstants ? interpConstants->posnormalmatrix[0][3] : 0.f,
                  interpConstants ? interpConstants->posnormalmatrix[1][3] : 0.f,
                  interpConstants ? interpConstants->posnormalmatrix[2][3] : 0.f,
-                 interpConstants ? interpConstants->transformmatrices[0][3] - plan.constants.transformmatrices[0][3] : 0.f,
-                 interpConstants ? interpConstants->transformmatrices[1][3] - plan.constants.transformmatrices[1][3] : 0.f,
-                 interpConstants ? interpConstants->transformmatrices[2][3] - plan.constants.transformmatrices[2][3] : 0.f,
+                 interpConstants ? interpConstants->transformmatrices[0][3] - plan.vertex_constants().transformmatrices[0][3] : 0.f,
+                 interpConstants ? interpConstants->transformmatrices[1][3] - plan.vertex_constants().transformmatrices[1][3] : 0.f,
+                 interpConstants ? interpConstants->transformmatrices[2][3] - plan.vertex_constants().transformmatrices[2][3] : 0.f,
                  plan.match_direct_position ? 1 : 0, plan.draw_tag, plan.draw_tag_age, plan.draw_scope, plan.draw_scope_part,
                  tracedPositions != nullptr ? 1 : 0);
   }
   // (Room too for a pixel block of the ubershader's, should the draw need one.)
   const size_t pixelRoom = pixelUniformBytes + sizeof(gxc::UberPixelConstants);
-  if (!staging_has_capacity(vertBytes + gxc::kVertexStrideBytes, indexBytes, sizeof(plan.constants), pixelRoom)) {
+  if (!staging_has_capacity(vertBytes + gxc::kVertexStrideBytes, indexBytes, sizeof(gxc::VertexShaderConstants), pixelRoom)) {
     if (!segment_frame() ||
-        !staging_has_capacity(vertBytes + gxc::kVertexStrideBytes, indexBytes, sizeof(plan.constants), pixelRoom)) {
+        !staging_has_capacity(vertBytes + gxc::kVertexStrideBytes, indexBytes, sizeof(gxc::VertexShaderConstants), pixelRoom)) {
       Log.error("GXCore draw exceeds an empty Aurora staging segment");
       return false;
     }
   }
 
   const auto uniformRange = push_uniform_dedup(
-      g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants),
-      sizeof(plan.constants), repeatsLast ? 1 : 0);
+      g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.vertex_constants()),
+      sizeof(gxc::VertexShaderConstants), repeatsLast ? 1 : 0);
   g_pushedConstantsId = plan.constants_id;
   Range pixelUniformRange{};
   bool pixelRepeats = false;
