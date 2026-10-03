@@ -348,6 +348,10 @@ bool dol_aurora_initialize(int argc, char** argv,
         aurora_set_frame_interp_steps(std::atoi(v));
     if (const char* v = std::getenv("DOL_AURORA_SHOW_FPS"); v != nullptr && v[0] != '\0')
         aurora_set_fps_overlay(v[0] != '0');
+    // DOL_AURORA_FPS_POSITION: where the counter goes, top-center (also when
+    // not one of these), top-left, top-right, bottom-left or bottom-right.
+    if (const char* v = std::getenv("DOL_AURORA_FPS_POSITION"); v != nullptr)
+        aurora_set_fps_overlay_position(aurora::fps_overlay_position(v));
     if (const char* v = std::getenv("DOL_AURORA_FORCE_ANISO"); v != nullptr && v[0] != '\0')
         aurora_set_forced_anisotropy(static_cast<unsigned>(std::strtoul(v, nullptr, 10)));
     // DOL_AURORA_TEXTURE_PACK: a folder of Dolphin-format replacement
