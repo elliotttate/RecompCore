@@ -1100,8 +1100,8 @@ PipelineRef pipeline_ref(const gxcore::PipelineConfig& config) {
     uint32_t generation = 0;
     bool valid = false;
   };
-  thread_local Memo memo[2];
-  Memo& m = memo[config.depthOnly != 0 ? 1 : 0];
+  thread_local Memo memo[3];
+  Memo& m = memo[config.depthOnly < 3u ? config.depthOnly : 0u];
   const uint32_t generation = pipeline_cache_generation();
   if (m.valid && m.generation == generation && std::memcmp(&m.config, &config, sizeof config) == 0)
     return m.ref;

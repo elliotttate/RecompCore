@@ -50,6 +50,13 @@ struct DrawData {
   bool tev = false; // TEV path: PS uniform at group 2, texture at group 3
   // A tagged particle's, whose in-between vertices are its own (interpVertRange).
   bool ownVertices = false;
+  // The ubershader's pipeline for this draw's fixed-function state, its
+  // pixel block (the pixel constants and the shader key) and a bind group with
+  // all eight texmaps, when the draw's own pipeline was still compiling as it
+  // was recorded: render() draws it with them if its own is not ready yet.
+  PipelineRef uberPipeline = 0;
+  Range uberPixelRange;
+  BindGroupRef uberTextureBindGroup = 0;
   // Consecutive draws of one state whose vertices and indices follow on are
   // one draw (submit_draw_plan); an in-between frame whose blocks for them
   // differ draws them one by one: their parts are batch_draw(batch + i), their

@@ -1,6 +1,7 @@
 add_library(gxruntime_gxcore STATIC
     src/gxcore.cpp
     src/gxcore_shader.cpp
+    src/gxcore_uber.cpp
     src/texture_decode.cpp
 )
 add_library(GXRuntime::gxcore ALIAS gxruntime_gxcore)

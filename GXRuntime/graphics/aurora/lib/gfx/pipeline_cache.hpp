@@ -32,5 +32,13 @@ template <typename Config>
 PipelineRef find_pipeline(ShaderType type, const Config& config, NewPipelineCallback&& cb);
 
 bool get_pipeline(PipelineRef ref, wgpu::RenderPipeline& pipeline);
+// Whether a pipeline find_pipeline() returned is compiled (cheap when none is
+// compiling).
+bool pipeline_ready(PipelineRef ref);
+// A gxcore draw whose own pipeline was not ready: drawn with the ubershader,
+// or left out of its frame (for the once-a-second report; a batch counts its
+// draws).
+void note_ubershader_draw();
+void note_draw_left_out(uint32_t draws);
 
 } // namespace aurora::gfx

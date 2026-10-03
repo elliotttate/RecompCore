@@ -608,4 +608,17 @@ struct EfbCopyCommand {
 std::string generate_wgsl(const ShaderKey& key);
 bool channel_lit_path(const ShaderKey& k, unsigned j);
 
+// The ubershader (gxcore_uber.cpp): one module for any key, which it reads
+// from the pixel uniform (UberPixelConstants), for a draw whose own pipeline
+// is still compiling. dual_source: the destination-alpha form.
+inline constexpr std::uint32_t kUberKeyWords =
+    static_cast<std::uint32_t>((sizeof(ShaderKey) + 15u) / 16u);
+struct UberPixelConstants {
+  PixelShaderConstants psc{};
+  std::uint32_t key[kUberKeyWords * 4u]{}; // the ShaderKey's bytes
+  std::uint32_t extra[4]{};                // [0]: more than one texmap sampled
+};
+static_assert(sizeof(PixelShaderConstants) % 16u == 0u);
+std::string generate_uber_wgsl(bool dual_source);
+
 } // namespace gxruntime::gxcore
