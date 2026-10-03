@@ -40,5 +40,9 @@ bool pipeline_ready(PipelineRef ref);
 // draws).
 void note_ubershader_draw();
 void note_draw_left_out(uint32_t draws);
+// The ubershader (gxcore_uber.cpp): 0 off, 1 for the draws whose own pipeline
+// is still compiling, 2 for every draw (testing). DOL_AURORA_UBERSHADER sets
+// it; the default is 1 on D3D12, where it was tested, and 0 elsewhere.
+int ubershader_mode();
 
 } // namespace aurora::gfx

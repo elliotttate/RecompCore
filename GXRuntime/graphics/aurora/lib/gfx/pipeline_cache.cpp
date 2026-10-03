@@ -713,11 +713,7 @@ static PipelineRef find_pipeline_impl(ShaderType type, const PipelineConfig& con
 static absl::flat_hash_set<HashType> g_uberStates;
 
 static void queue_ubershader_state(const gxcore::PipelineConfig& config) {
-  static const bool enabled = [] {
-    const char* env = std::getenv("DOL_AURORA_UBERSHADER");
-    return env == nullptr || env[0] != '0';
-  }();
-  if (!enabled || config.depthOnly != 0u)
+  if (ubershader_mode() == 0 || config.depthOnly != 0u)
     return;
   gxcore::PipelineConfig uber = config;
   uber.key.shader = {};
@@ -1483,6 +1479,16 @@ void end_pipeline_frame() {
 }
 
 void note_ubershader_draw() { g_uberDraws.fetch_add(1, std::memory_order_relaxed); }
+
+int ubershader_mode() {
+  static const int mode = [] {
+    const char* env = std::getenv("DOL_AURORA_UBERSHADER");
+    if (env != nullptr && env[0] != '\0')
+      return std::atoi(env);
+    return webgpu::g_backendType == wgpu::BackendType::D3D12 ? 1 : 0;
+  }();
+  return mode;
+}
 void note_draw_left_out(uint32_t draws) { g_leftOutDraws.fetch_add(draws, std::memory_order_relaxed); }
 
 bool pipeline_ready(PipelineRef ref) {

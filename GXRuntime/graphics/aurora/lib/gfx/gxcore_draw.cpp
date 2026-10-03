@@ -717,10 +717,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   // depth. Binding the color pipeline first is harmless; it is rebound below.
   // A draw whose own are not ready yet is drawn with the ubershader, if it was
   // recorded with its data (submit_draw_plan), without the depth prepass.
-  static const bool uberForced = [] {
-    const char* env = std::getenv("DOL_AURORA_UBERSHADER");
-    return env != nullptr && env[0] == '2';
-  }();
+  static const bool uberForced = ubershader_mode() == 2;
   bool uberDraw = false;
   if (uberForced && data.uberPipeline != 0) {
     if (!bind(data.uberPipeline)) {
@@ -1895,12 +1892,10 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // state, few, and kept in the pipeline cache like any other. The draw gets
   // a pixel block with its shader key and a bind group with all eight texmaps,
   // used only if its own pipeline is still not ready when it is encoded.
-  // DOL_AURORA_UBERSHADER=0 turns it off; =2 draws every draw with it
-  // (testing: a frame drawn both ways can be compared).
-  static const int uberMode = [] {
-    const char* env = std::getenv("DOL_AURORA_UBERSHADER");
-    return env == nullptr || env[0] == '\0' ? 1 : std::atoi(env);
-  }();
+  // On by default on D3D12 (ubershader_mode()); DOL_AURORA_UBERSHADER=0 turns
+  // it off, =2 draws every draw with it (testing: a frame drawn both ways can
+  // be compared).
+  static const int uberMode = ubershader_mode();
   PipelineRef uberPipeline = 0;
   Range uberPixelRange{};
   BindGroupRef uberTextureBindGroup = 0;
