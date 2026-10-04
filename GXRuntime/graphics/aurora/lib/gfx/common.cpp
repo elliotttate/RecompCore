@@ -1669,9 +1669,10 @@ void end_frame(EndFrameCallback callback) {
   if (frame_interp::tracing() || g_presentLog ||
       (frame.interpolate && frame_interp::dump_frame(frame_interp::game_frame_number()))) {
     Log.info("In-between data for game frame {}: {} bytes of constants and {} of vertices, {} blocks did not fit; "
-             "frame uniforms {} bytes",
+             "frame uniforms {} bytes, vertices {}, indices {}, draws {} ({} merged)",
              frame_interp::game_frame_number(), interpSlot.uniformUsed, interpSlot.vertexUsed,
-             g_interpUniformOverflows, frame.uniforms.size());
+             g_interpUniformOverflows, frame.uniforms.size(), frame.verts.size(), frame.indices.size(),
+             g_drawCallCount, g_mergedDrawCallCount);
   }
   g_interpUniformOverflows = 0;
   if (frame_interp::tracing()) {
