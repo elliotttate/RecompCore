@@ -125,6 +125,9 @@ public:
 
   std::uint32_t bp(std::uint8_t reg) const { return bp_regs_[reg]; }
   bool bp_valid(std::uint8_t reg) const { return bp_valid_[reg]; }
+  // Whether the vertex descriptor indexes positions from an array (rather
+  // than sending them with each vertex).
+  bool position_indexed() const { return vcd_lo_valid_ && ((vcd_lo_ >> 9) & 3u) >= 2u; }
   // The draw tag goes with one draw (DrawPlan::draw_tag); a scope starts at
   // one draw and covers the count of draws it gives (GxCoreSink).
   void forget_draw_tag() {
@@ -232,6 +235,12 @@ private:
   std::uint32_t scope_left_ = 0;
   std::uint32_t scope_part_ = 0;
   bool scope_indexed_ = false;
+  // Draw fusion (submit_packet): whether the last draw packet was of
+  // triangles, and the most vertices a fused draw takes, frame_interp's
+  // kMaxBlendedVertices, so a mesh the game moves vertex by vertex stays one
+  // Smooth Motion blends.
+  bool last_draw_triangles_ = false;
+  static constexpr std::uint32_t kFuseMaxVertices = 1024u;
   PlanObserver plan_observer_ = nullptr;
   void* plan_observer_user_ = nullptr;
   CopyObserver copy_observer_ = nullptr;

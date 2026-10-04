@@ -1271,9 +1271,24 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
   } else if (primitive == ar::GxPrimitive::Points) {
     pipe.primitive_topology = 2u;
   }
-  const std::uint32_t index_count = ar::build_topology_indices(
-      primitive, 0u, static_cast<std::uint16_t>(draw.vertex_count),
-      &plan.indices);
+  std::uint32_t index_count = 0;
+  if (draw.segments.empty()) {
+    index_count = ar::build_topology_indices(
+        primitive, 0u, static_cast<std::uint16_t>(draw.vertex_count),
+        &plan.indices);
+  } else {
+    // Primitives fused onto the draw (GxCoreSink::submit_packet), each from
+    // where the one before ends: the indices the draws apart had, rebased.
+    std::uint32_t start = 0;
+    for (const std::uint32_t segment : draw.segments) {
+      const std::uint32_t count = segment & 0xFFFFu;
+      index_count += ar::build_topology_indices(
+          static_cast<ar::GxPrimitive>((segment >> 16) & 0xF8u),
+          static_cast<std::uint16_t>(start), static_cast<std::uint16_t>(count),
+          &plan.indices);
+      start += count;
+    }
+  }
   if (index_count == 0u) {
     switch (primitive) {
     case ar::GxPrimitive::Quads:
@@ -2066,6 +2081,27 @@ bool GxCoreSink::submit_packet(const ar::RenderPacket& packet) {
       if ((r.format & 0x10u) != 0u)
         ++counters_.efb_copy_depth;
     }
+  }
+  // Draw fusion: a display list's primitives mostly follow one another with
+  // no state between them (nine draws in ten at Forest Haven), and each was
+  // planned, submitted and matched for Smooth Motion apart, to be batched
+  // together at the end. Such a primitive joins the draw before: triangles
+  // after triangles, positions from an array (not a particle's, a sprite's or
+  // a wake's own), outside a draw scope and a tagged draw, and up to
+  // kFuseMaxVertices. The consumer checks the rest (no texture or copy
+  // between, the same vertex format and transform). DOL_GX_FUSE=0 turns it off.
+  if (packet.kind == ar::RenderPacketKind::Draw) {
+    static const bool s_fuse = [] {
+      const char* env = std::getenv("DOL_GX_FUSE");
+      return env == nullptr || env[0] != '0';
+    }();
+    const std::uint32_t primitive = packet.draw.primitive & 0xF8u;
+    const bool triangles = primitive == 0x80u || primitive == 0x90u || primitive == 0x98u || primitive == 0xA0u;
+    if (s_fuse && triangles && last_draw_triangles_ && since_draw_.empty() && !replay_overflow_ &&
+        scope_left_ == 0u && !pending_state_.bp_valid(GxCoreState::kDrawScopeRegister) &&
+        !pending_state_.bp_valid(GxCoreState::kDrawTagRegister) && pending_state_.position_indexed())
+      consumer_.fuse_next_draw(kFuseMaxVertices);
+    last_draw_triangles_ = triangles;
   }
   // Forward first: a Draw packet makes the PREVIOUS draw span-complete and
   // fires the observer, which must see the state that was current at that

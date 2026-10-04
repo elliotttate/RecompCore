@@ -572,6 +572,8 @@ void dol_aurora_shutdown(void) {
 #if GXRUNTIME_HAS_AURORA_RECOMP
     gx_aurora::trace_close_and_log();
     if (gx_aurora::g_gx_core_enabled) {
+        std::fprintf(stderr, "[gx-core] draws fused onto the draw before: %llu\n",
+                     gx_aurora::g_core_sink.consumer().fused_draws());
         const auto& gaps = gx_aurora::g_core_sink.counters();
         std::fprintf(stderr,
                      "[gx-core] shutdown: submitted=%llu rejected=%llu "

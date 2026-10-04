@@ -114,7 +114,24 @@ bool ConsumingAuroraRenderSink::submit_packet(const RenderPacket& packet) {
       if (!draws_.empty() && packet.resource.index < kArrayCount) {
         ConsumedDraw& draw = draws_.back();
         const ConsumedArrayBinding& binding = arrays_[packet.resource.index];
-        if (draw.array_input_count < ConsumedDraw::kMaxArrays) {
+        // A primitive fused onto the draw reads the arrays the draw's first
+        // did (no state changed): its span joins theirs. Spans start at the
+        // array's base, so the longer covers both.
+        ConsumedArrayInput* fused = nullptr;
+        if (!draw.segments.empty())
+          for (std::uint32_t i = 0; i < draw.array_input_count; ++i)
+            if (draw.arrays[i].attr == packet.resource.index)
+              fused = &draw.arrays[i];
+        if (fused != nullptr) {
+          if (packet.resource.size > fused->span_size) {
+            untally_array_input(fused->resolved);
+            fused->span_size = packet.resource.size;
+            fused->resolved = false;
+            fused->host_data = nullptr;
+            fused->host_available = 0;
+            tally_array_input(resolve_array_input(*fused));
+          }
+        } else if (draw.array_input_count < ConsumedDraw::kMaxArrays) {
           ConsumedArrayInput& input = draw.arrays[draw.array_input_count++];
           input.attr = packet.resource.index;
           input.base = binding.base;
@@ -129,6 +146,7 @@ bool ConsumingAuroraRenderSink::submit_packet(const RenderPacket& packet) {
       }
       break;
     case RenderResourceKind::Texture:
+      resource_since_draw_ = true;
       ++texture_count_;
       if (packet.resource.size == 0u)
         return fail("empty texture packet", packet);
@@ -177,11 +195,13 @@ bool ConsumingAuroraRenderSink::submit_packet(const RenderPacket& packet) {
         bound_textures_[bound_texture_.slot] = bound_texture_;
       break;
     case RenderResourceKind::Tlut:
+      resource_since_draw_ = true;
       ++tlut_count_;
       if (packet.resource.size == 0u)
         return fail("empty tlut packet", packet);
       break;
     case RenderResourceKind::CopyDestination:
+      resource_since_draw_ = true;
       ++copy_count_;
       // Display copies (GXCopyDisp, format 0xF) carry no texture destination
       // — only the copy-clear params — so zero size is their normal shape.
@@ -193,6 +213,32 @@ bool ConsumingAuroraRenderSink::submit_packet(const RenderPacket& packet) {
   case RenderPacketKind::Draw: {
     if (packet.draw.vertex_count == 0u || packet.draw.vertex_size == 0u)
       return fail("empty draw packet", packet);
+    const std::uint32_t fuse_max = fuse_max_;
+    const bool resources = resource_since_draw_;
+    fuse_max_ = 0;
+    resource_since_draw_ = false;
+    if (fuse_max != 0u && streaming_ && draws_.size() == 1u && !back_assembled_ && !resources) {
+      ConsumedDraw& draw = draws_[0];
+      const std::size_t bytes = static_cast<std::size_t>(packet.draw.vertex_count) * packet.draw.vertex_size;
+      if (draw.vtx_fmt == packet.draw.vtx_fmt && draw.vertex_size == packet.draw.vertex_size &&
+          draw.xf_version != 0u && draw.xf_version == packet.draw.xf_version &&
+          draw.vertex_count + packet.draw.vertex_count <= fuse_max && packet.draw.vertex_payload != nullptr &&
+          packet.draw.vertex_payload_size == bytes &&
+          draw.vertex_payload.size() == static_cast<std::size_t>(draw.vertex_count) * draw.vertex_size) {
+        if (draw.segments.empty())
+          draw.segments.push_back((draw.primitive << 16) | draw.vertex_count);
+        draw.segments.push_back((packet.draw.primitive << 16) | packet.draw.vertex_count);
+        draw.vertex_count += packet.draw.vertex_count;
+        draw.vertex_payload.insert(draw.vertex_payload.end(), packet.draw.vertex_payload,
+                                   packet.draw.vertex_payload + bytes);
+        draw.payload_pn_matrix_mask |= packet.draw.payload_pn_matrix_mask;
+        payload_bytes_ += bytes;
+        ++total_draws_;
+        ++fused_draws_;
+        total_vertices_ += packet.draw.vertex_count;
+        return true;
+      }
+    }
     std::uint32_t active_mask = 0;
     for (std::uint32_t i = 0; i < kArrayCount; ++i) {
       if (arrays_[i].base_valid && arrays_[i].stride_valid)
@@ -222,6 +268,7 @@ bool ConsumingAuroraRenderSink::submit_packet(const RenderPacket& packet) {
       // draw only for the copies below to overwrite it).
       slot->array_input_count = 0u;
       slot->vertex_payload.clear();
+      slot->segments.clear();
     } else {
       if (streaming_)
         draws_.clear();

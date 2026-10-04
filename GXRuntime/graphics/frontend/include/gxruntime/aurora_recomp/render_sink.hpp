@@ -264,6 +264,10 @@ struct ConsumedDraw {
   // per-vertex indices), retained from the Draw packet so an issuing sink can
   // assemble vertices after submit. Empty when the packet carried no payload.
   std::vector<std::uint8_t> vertex_payload;
+  // Primitives fused onto this draw (ConsumingAuroraRenderSink::fuse_next_draw):
+  // each (primitive << 16) | vertex count, in payload order, the first one
+  // included. Empty for a draw of one primitive (`primitive`, `vertex_count`).
+  std::vector<std::uint32_t> segments;
   std::uint64_t xf_version = 0; // as in RenderDrawPacket
   std::uint32_t transform_flags = 0;
   std::uint32_t current_pn_matrix = 0;
@@ -331,6 +335,14 @@ public:
     draw_observer_ = observer;
     draw_observer_user_ = user;
   }
+  // Fusion (streaming mode): the next Draw packet joins the retained draw
+  // instead of completing it, when nothing but that draw's array spans came
+  // between them, the two share a vertex format and transform version, and
+  // together they have at most `max_vertices`. The caller vouches that no state
+  // changed between them and that both are triangle primitives. Applies to the
+  // next Draw packet only.
+  void fuse_next_draw(std::uint32_t max_vertices) { fuse_max_ = max_vertices; }
+  unsigned long long fused_draws() const { return fused_draws_; }
 
   const std::vector<ConsumedDraw>& draws() const { return draws_; }
   unsigned long long packets() const { return packets_; }
@@ -450,6 +462,9 @@ private:
   unsigned long long topology_index_bytes_ = 0;
   unsigned long long storage_bytes_ = 0;
   bool back_assembled_ = false;
+  std::uint32_t fuse_max_ = 0;
+  bool resource_since_draw_ = false; // a texture, TLUT or copy since the last draw
+  unsigned long long fused_draws_ = 0;
   std::uint64_t last_sequence_ = 0;
   bool has_last_sequence_ = false;
   const char* failure_reason_ = nullptr;

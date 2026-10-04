@@ -780,6 +780,134 @@ void test_fifth_texgen_plan_decode() {
   CHECK((texidx_hi & 0xFFu) == 33u);
 }
 
+// Draw fusion: primitives that follow one another with nothing between them
+// join one consumed draw (ConsumingAuroraRenderSink::fuse_next_draw), whose
+// plan has the vertices and the triangle indices the draws apart had, the
+// second's rebased; a texture between them, or no fuse request, keeps them
+// apart.
+ar::ConsumedDraw g_fused_draws[4];
+int g_fused_draw_count = 0;
+void capture_consumed(const ar::ConsumedDraw& draw, unsigned long long, void*) {
+  if (g_fused_draw_count < 4)
+    g_fused_draws[g_fused_draw_count] = draw;
+  ++g_fused_draw_count;
+}
+
+void test_draw_fusion() {
+  gxc::GxCoreState state;
+  state.reset();
+  state.apply({.kind = ar::RenderStateKind::CpVcd, .index = 0u, .value = 1u << 9u}); // position direct
+  state.apply({.kind = ar::RenderStateKind::CpVcd, .index = 1u, .value = 0u});
+  state.apply({.kind = ar::RenderStateKind::CpVat, .index = 0u, .value = 1u | (4u << 1u), .aux0 = 0u}); // xyz f32
+  state.apply({.kind = ar::RenderStateKind::CpVat, .index = 0u, .value = 0u, .aux0 = 1u});
+  state.apply({.kind = ar::RenderStateKind::CpVat, .index = 0u, .value = 0u, .aux0 = 2u});
+
+  // Two triangle strips, of 4 and 5 vertices.
+  std::vector<std::uint8_t> payloads[2];
+  for (int strip = 0; strip < 2; ++strip)
+    for (int v = 0; v < 4 + strip; ++v) {
+      append_be_f32(payloads[strip], static_cast<float>(10 * strip + v));
+      append_be_f32(payloads[strip], static_cast<float>(v & 1));
+      append_be_f32(payloads[strip], 0.f);
+    }
+  const auto draw_packet = [&](int strip, std::uint64_t sequence) {
+    ar::RenderPacket p;
+    p.kind = ar::RenderPacketKind::Draw;
+    p.sequence = sequence;
+    p.draw.primitive = 0x98u;
+    p.draw.vtx_fmt = 0u;
+    p.draw.vertex_count = static_cast<std::uint32_t>(4 + strip);
+    p.draw.vertex_size = 12u;
+    p.draw.vertex_payload = payloads[strip].data();
+    p.draw.vertex_payload_size = static_cast<std::uint32_t>(payloads[strip].size());
+    p.draw.xf_version = 7u;
+    p.draw.transform_flags = ar::kDrawTransformProjectionValid;
+    p.draw.projection[0] = 1.f;
+    p.draw.projection[2] = 1.f;
+    p.draw.projection[4] = -1.f;
+    p.draw.projection_type = 1u;
+    p.draw.position_matrix_valid_mask = 1u;
+    p.draw.position_matrices[0][0] = 1.f;
+    p.draw.position_matrices[0][5] = 1.f;
+    p.draw.position_matrices[0][10] = 1.f;
+    return p;
+  };
+
+  // Fused: one consumed draw of both strips.
+  ar::ConsumingAuroraRenderSink consumer;
+  consumer.set_streaming(true);
+  consumer.set_assembly_totals(false);
+  consumer.set_draw_observer(capture_consumed, nullptr);
+  g_fused_draw_count = 0;
+  consumer.submit_packet(draw_packet(0, 1u));
+  consumer.fuse_next_draw(1024u);
+  consumer.submit_packet(draw_packet(1, 2u));
+  consumer.flush_assembly();
+  CHECK(g_fused_draw_count == 1);
+  CHECK(consumer.fused_draws() == 1u);
+  const ar::ConsumedDraw fused = g_fused_draws[0];
+  CHECK(fused.vertex_count == 9u);
+  CHECK(fused.segments.size() == 2u);
+  CHECK(fused.vertex_payload.size() == 9u * 12u);
+
+  // Apart: the same strips as two draws.
+  ar::ConsumingAuroraRenderSink apart;
+  apart.set_streaming(true);
+  apart.set_assembly_totals(false);
+  apart.set_draw_observer(capture_consumed, nullptr);
+  g_fused_draw_count = 0;
+  apart.submit_packet(draw_packet(0, 1u));
+  apart.submit_packet(draw_packet(1, 2u)); // no fuse request
+  apart.flush_assembly();
+  CHECK(g_fused_draw_count == 2);
+  const ar::ConsumedDraw first = g_fused_draws[0];
+  const ar::ConsumedDraw second = g_fused_draws[1];
+
+  gxc::GapCounters gaps;
+  const gxc::DrawPlan whole = state.build_draw_plan(fused, gaps);
+  const gxc::DrawPlan a = state.build_draw_plan(first, gaps);
+  const gxc::DrawPlan b = state.build_draw_plan(second, gaps);
+  CHECK(whole.ok && a.ok && b.ok);
+  std::vector<std::uint16_t> expected = a.indices;
+  for (const std::uint16_t index : b.indices)
+    expected.push_back(static_cast<std::uint16_t>(index + 4u));
+  CHECK(whole.indices == expected);
+  CHECK(whole.vertices.size() == a.vertices.size() + b.vertices.size());
+  CHECK(std::equal(a.vertices.begin(), a.vertices.end(), whole.vertices.begin()));
+  CHECK(std::equal(b.vertices.begin(), b.vertices.end(), whole.vertices.begin() + a.vertices.size()));
+
+  // A texture between the strips keeps them apart, fuse request or not.
+  ar::ConsumingAuroraRenderSink textured;
+  textured.set_streaming(true);
+  textured.set_assembly_totals(false);
+  textured.set_draw_observer(capture_consumed, nullptr);
+  g_fused_draw_count = 0;
+  textured.submit_packet(draw_packet(0, 1u));
+  ar::RenderPacket texture;
+  texture.kind = ar::RenderPacketKind::Resource;
+  texture.sequence = 2u;
+  texture.resource.kind = ar::RenderResourceKind::Texture;
+  texture.resource.size = 32u;
+  textured.submit_packet(texture);
+  textured.fuse_next_draw(1024u);
+  textured.submit_packet(draw_packet(1, 3u));
+  textured.flush_assembly();
+  CHECK(g_fused_draw_count == 2);
+  CHECK(textured.fused_draws() == 0u);
+
+  // Past the vertex cap: apart.
+  ar::ConsumingAuroraRenderSink capped;
+  capped.set_streaming(true);
+  capped.set_assembly_totals(false);
+  capped.set_draw_observer(capture_consumed, nullptr);
+  g_fused_draw_count = 0;
+  capped.submit_packet(draw_packet(0, 1u));
+  capped.fuse_next_draw(8u);
+  capped.submit_packet(draw_packet(1, 2u));
+  capped.flush_assembly();
+  CHECK(g_fused_draw_count == 2);
+}
+
 // The dual-texture post transform is folded into a regular texgen's matrix
 // rows: post * (texmtx * coord) for a three-row (STQ) texgen, and post *
 // (s, t, 1) for a two-row (ST) one. The lava (d_magma.cpp) uses it.
@@ -2016,6 +2144,7 @@ int main() {
   test_cached_normal();
   test_fog();
   test_efb_copy_sink();
+  test_draw_fusion();
   if (g_failures != 0) {
     std::fprintf(stderr, "gxcore_tests: %d failure(s)\n", g_failures);
     return 1;
