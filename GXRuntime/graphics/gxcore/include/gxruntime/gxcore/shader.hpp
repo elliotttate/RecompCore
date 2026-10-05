@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <vector>
 
@@ -684,5 +685,27 @@ struct UberPixelConstants {
 };
 static_assert(sizeof(PixelShaderConstants) % 16u == 0u);
 std::string generate_uber_wgsl(bool dual_source);
+
+// A generated module (generate_wgsl, generate_uber_wgsl) that reads its
+// constants from storage instead of dynamic-offset uniform bindings, so a draw
+// sets 16 bytes of immediate data rather than two bind groups (each bind cost
+// the render worker about 330 ns on a slow core, 2026-10-05): group(1) is the
+// frame's constant buffer (binding 0) and the in-between frames' (binding 1),
+// read-only storage bound once a pass; the immediate DrawConstants holds where
+// the draw's vertex block, matrix memory, lights and pixel constants are, in
+// 16-byte rows, kConstantsInBetween set for a row of the in-between buffer.
+// vsc., vsm., vsl. and psc. reads become loads at those rows; the bindings of
+// the four parts go, and the texture group stays where it was (group(2), the
+// pixel constants' old place, takes an empty layout on the TEV path).
+struct DrawConstants {
+  std::uint32_t block = 0;
+  std::uint32_t matrices = 0;
+  std::uint32_t lights = 0;
+  std::uint32_t pixel = 0;
+  bool operator==(const DrawConstants&) const = default;
+};
+static_assert(sizeof(DrawConstants) == 16);
+inline constexpr std::uint32_t kConstantsInBetween = 0x80000000u;
+std::string immediate_constants_wgsl(std::string_view wgsl);
 
 } // namespace gxruntime::gxcore

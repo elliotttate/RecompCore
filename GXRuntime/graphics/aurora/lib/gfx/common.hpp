@@ -206,6 +206,16 @@ extern wgpu::BindGroup g_interpUniformBindGroup;
 extern wgpu::BindGroupLayout g_vertexUniformBindGroupLayout;
 extern wgpu::BindGroup g_vertexUniformBindGroup;
 extern wgpu::BindGroup g_interpVertexUniformBindGroup;
+// Or, where the device has immediate data (immediate_constants()), a gxcore
+// draw reads its constants from storage at the rows its immediate data names
+// (gxruntime/gxcore/shader.hpp DrawConstants): group 1 is the frame's and the
+// in-between frames' constant buffers, bound once a pass, and an empty group
+// stands where the pixel constants were.
+bool immediate_constants() noexcept;
+extern wgpu::BindGroupLayout g_drawConstantsBindGroupLayout;
+const wgpu::BindGroup& draw_constants_bind_group();
+extern wgpu::BindGroupLayout g_emptyBindGroupLayout;
+extern wgpu::BindGroup g_emptyBindGroup;
 
 using BindGroupRef = HashType;
 using PipelineRef = HashType;
@@ -399,6 +409,22 @@ DrawData* get_last_draw_command();
 template <typename PipelineConfig>
 PipelineRef pipeline_ref(const PipelineConfig& config);
 bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass);
+
+// What the render worker hands Dawn encoding passes, and the time it takes,
+// for DOL_AURORA_ENCODE_STATS's [encode-stats] lines (per game frame).
+struct EncodeStats {
+  uint64_t passes = 0;
+  uint64_t draws = 0;
+  uint64_t group1 = 0;
+  uint64_t group2 = 0;
+  uint64_t group3 = 0;
+  uint64_t pipelines = 0;
+  uint64_t vertexBuffers = 0;
+  uint64_t immediates = 0;
+  uint64_t encodeNs = 0;
+  uint64_t submitNs = 0;
+};
+extern EncodeStats g_encodeStats;
 
 BindGroupRef bind_group_ref(const WGPUBindGroupDescriptor& descriptor);
 wgpu::BindGroup find_bind_group(BindGroupRef id);

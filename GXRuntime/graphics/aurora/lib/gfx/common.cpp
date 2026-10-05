@@ -26,6 +26,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <optional>
@@ -168,6 +170,15 @@ wgpu::BindGroupLayout g_uniformBindGroupLayout;
 wgpu::BindGroup g_uniformBindGroup;
 wgpu::BindGroupLayout g_vertexUniformBindGroupLayout;
 wgpu::BindGroup g_vertexUniformBindGroup;
+static bool g_immediateConstants = false;
+wgpu::BindGroupLayout g_drawConstantsBindGroupLayout;
+static wgpu::BindGroup g_drawConstantsBindGroup;
+static WGPUBuffer g_drawConstantsBetween = nullptr; // the in-between buffer the group binds
+static wgpu::Buffer g_betweenPlaceholder;            // bound before there is one
+wgpu::BindGroupLayout g_emptyBindGroupLayout;
+wgpu::BindGroup g_emptyBindGroup;
+
+bool immediate_constants() noexcept { return g_immediateConstants; }
 
 // The gxcore vertex block's three bindings over `buffer`, each its part's size.
 static wgpu::BindGroup vertex_uniform_bind_group(const wgpu::Buffer& buffer, const char* label) {
@@ -1232,8 +1243,8 @@ void initialize() {
     out = g_device.CreateBuffer(&descriptor);
   };
   reset_vertex_shadow();
-  createBuffer(g_uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst, UniformBufferSize,
-               "Shared Uniform Buffer");
+  createBuffer(g_uniformBuffer, wgpu::BufferUsage::Uniform | wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
+               UniformBufferSize, "Shared Uniform Buffer");
   createBuffer(g_vertexBuffer, wgpu::BufferUsage::Storage | wgpu::BufferUsage::Vertex | wgpu::BufferUsage::CopyDst,
                VertexBufferSize, "Shared Vertex Buffer");
   createBuffer(g_indexBuffer, wgpu::BufferUsage::Index | wgpu::BufferUsage::CopyDst, IndexBufferSize,
@@ -1352,6 +1363,44 @@ void initialize() {
     g_vertexUniformBindGroupLayout = g_device.CreateBindGroupLayout(&layoutDesc);
     g_vertexUniformBindGroup = vertex_uniform_bind_group(g_uniformBuffer, "GXCore vertex uniform bind group");
   }
+  {
+    // Immediate data, WGSL's immediate address space and four storage buffers
+    // a stage (webgpu/gpu.cpp); DOL_AURORA_IMMEDIATE_CONSTANTS=0 keeps the
+    // dynamic-offset bindings.
+    const char* env = std::getenv("DOL_AURORA_IMMEDIATE_CONSTANTS");
+    g_immediateConstants =
+        (env == nullptr || std::strcmp(env, "0") != 0) && g_cachedLimits.maxImmediateSize >= 16 &&
+        g_cachedLimits.maxImmediateSize != WGPU_LIMIT_U32_UNDEFINED &&
+        g_cachedLimits.maxStorageBuffersPerShaderStage >= 4 &&
+        g_cachedLimits.maxStorageBufferBindingSize >= InterpUniformBufferSize &&
+        g_instance.HasWGSLLanguageFeature(wgpu::WGSLLanguageFeatureName::ImmediateAddressSpace);
+    Log.info("gxcore constants: {}", g_immediateConstants ? "storage rows in immediate data" : "dynamic uniform offsets");
+    std::array<wgpu::BindGroupLayoutEntry, 2> layoutEntries{};
+    for (uint32_t i = 0; i < layoutEntries.size(); ++i)
+      layoutEntries[i] = wgpu::BindGroupLayoutEntry{
+          .binding = i,
+          .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
+          .buffer = wgpu::BufferBindingLayout{.type = wgpu::BufferBindingType::ReadOnlyStorage},
+      };
+    const wgpu::BindGroupLayoutDescriptor layoutDesc{
+        .label = "GXCore constants bind group layout",
+        .entryCount = layoutEntries.size(),
+        .entries = layoutEntries.data(),
+    };
+    g_drawConstantsBindGroupLayout = g_device.CreateBindGroupLayout(&layoutDesc);
+    const wgpu::BindGroupLayoutDescriptor emptyDesc{.label = "Empty bind group layout"};
+    g_emptyBindGroupLayout = g_device.CreateBindGroupLayout(&emptyDesc);
+    const wgpu::BindGroupDescriptor emptyGroup{.label = "Empty bind group", .layout = g_emptyBindGroupLayout};
+    g_emptyBindGroup = g_device.CreateBindGroup(&emptyGroup);
+    const wgpu::BufferDescriptor placeholder{
+        .label = "In-between constants placeholder",
+        .usage = wgpu::BufferUsage::Storage,
+        .size = 256,
+    };
+    g_betweenPlaceholder = g_device.CreateBuffer(&placeholder);
+    g_drawConstantsBindGroup = {};
+    g_drawConstantsBetween = nullptr;
+  }
 
   gx::initialize();
 #ifdef AURORA_ENABLE_RMLUI
@@ -1374,6 +1423,9 @@ void shutdown() {
   g_lastDue = {};
   g_interpUniformBindGroup = {};
   g_interpVertexUniformBindGroup = {};
+  g_drawConstantsBindGroup = {};
+  g_drawConstantsBetween = nullptr;
+  g_betweenPlaceholder = {};
   g_interpUniformBuffer = {};
   g_interpUniformBufferSize = 0;
   g_interpVertexBuffer = {};
@@ -1435,6 +1487,9 @@ void shutdown() {
   g_uniformBindGroupLayout = {};
   g_vertexUniformBindGroup = {};
   g_vertexUniformBindGroupLayout = {};
+  g_drawConstantsBindGroupLayout = {};
+  g_emptyBindGroup = {};
+  g_emptyBindGroupLayout = {};
   g_inOffscreen = false;
   g_frameIndex = UINT32_MAX;
   g_frameSlots.reset();
@@ -1946,6 +2001,10 @@ static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& f
     vertBytes += range.end - range.begin;
   }
   webgpu::gpu_prof::count_copy(CopyKind::Vertices, vertBytes);
+  webgpu::gpu_prof::count_copy_commands(static_cast<uint32_t>(op.vertDirty.size()) +
+                                        (highWater.uniforms > frame.copied.uniforms) +
+                                        (highWater.indices > frame.copied.indices) +
+                                        (highWater.storage > frame.copied.storage));
   frame.copied.verts = std::max(frame.copied.verts, highWater.verts);
   copy_staging_buffer_range(cmd, frame, frame.copied.uniforms, highWater.uniforms, UniformStagingOffset,
                             g_uniformBuffer);
@@ -2047,9 +2106,13 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
       .timestampWrites = webgpu::gpu_prof::pass_writes(label),
   };
 
+  const auto encodeStart = std::chrono::steady_clock::now();
   auto pass = cmd.BeginRenderPass(&renderPassDescriptor);
   render_pass(pass, frame, passInfo);
   pass.End();
+  ++g_encodeStats.passes;
+  g_encodeStats.encodeNs += static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - encodeStart).count());
 
   if (passInfo.captureDepthSnapshot && !frame_interp::encoding_interpolated()) {
     depth_peek::encode_frame_snapshot(cmd, passInfo.copySourceDepthView, passInfo.targetSize, passInfo.msaaSamples);
@@ -2100,10 +2163,29 @@ static void render(wgpu::CommandEncoder& cmd, FramePacket& frame, RenderPass& pa
 
 // --- In-between frames (frame_interp.hpp) -------------------------------------
 
+EncodeStats g_encodeStats;
+
+static void log_encode_stats() {
+  static const bool enabled = std::getenv("DOL_AURORA_ENCODE_STATS") != nullptr;
+  static uint32_t frames = 0;
+  if (!enabled || ++frames < 240)
+    return;
+  const double n = frames;
+  const EncodeStats& s = g_encodeStats;
+  std::fprintf(stderr,
+               "[encode-stats] per game frame: passes=%.1f draws=%.0f group1=%.0f group2=%.0f group3=%.0f "
+               "pipelines=%.0f vbufs=%.0f immediates=%.0f encode_ms=%.3f submit_ms=%.3f\n",
+               s.passes / n, s.draws / n, s.group1 / n, s.group2 / n, s.group3 / n, s.pipelines / n,
+               s.vertexBuffers / n, s.immediates / n, s.encodeNs / n * 1e-6, s.submitNs / n * 1e-6);
+  g_encodeStats = {};
+  frames = 0;
+}
+
 // The game frame's period, measured at its end on the render worker. Also the
 // gate: the in-between frame only helps a game slower than about 40 FPS, and
 // the first frames after a start or a stall have no period yet.
 static bool note_game_frame_end() {
+  log_encode_stats();
   const auto now = PresentClock::now();
   {
     std::lock_guard lock{g_presentStatsMutex};
@@ -2257,7 +2339,7 @@ static void upload_interp_data(size_t frameSlot) {
         std::min(InterpUniformBufferSize, AURORA_ALIGN(std::max(needed, InterpUniformStepSize), InterpUniformStepSize));
     const wgpu::BufferDescriptor descriptor{
         .label = "In-between frame uniform buffer",
-        .usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::CopyDst,
+        .usage = wgpu::BufferUsage::Uniform | wgpu::BufferUsage::Storage | wgpu::BufferUsage::CopyDst,
         .size = g_interpUniformBufferSize,
     };
     g_interpUniformBuffer = g_device.CreateBuffer(&descriptor);
@@ -2423,8 +2505,11 @@ static void present_steps(FramePacket& frame, size_t frameSlot, wgpu::CommandEnc
       replay_op(between, frame, op);
     frame_interp::set_encoding_interpolated(false);
     keep(between, held[step]);
+    const auto submitStart = std::chrono::steady_clock::now();
     const auto buffer = between.Finish();
     g_queue.Submit(1, &buffer);
+    g_encodeStats.submitNs += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submitStart).count());
     if (g_presentLog)
       std::fprintf(stderr, "[encode-took] step=%d %.2f\n", step,
                    std::chrono::duration<double, std::milli>(PresentClock::now() - encodeStart).count());
@@ -2693,6 +2778,7 @@ bool bind_pipeline(PipelineRef ref, const wgpu::RenderPassEncoder& pass) {
     return false;
   }
   pass.SetPipeline(pipeline);
+  ++g_encodeStats.pipelines;
   g_currentPipeline = ref;
   return true;
 }
@@ -2908,6 +2994,29 @@ BindGroupRef bind_group_ref(const WGPUBindGroupDescriptor& descriptor) {
     it->second.lastUsedFrame = g_frameIndex;
   }
   return id;
+}
+
+// The frame's constant buffer and the in-between frames' (or a placeholder
+// until there is one) as group 1 of an immediate-constants pipeline; made again
+// when the in-between buffer grows (render worker).
+const wgpu::BindGroup& draw_constants_bind_group() {
+  const WGPUBuffer between = g_interpUniformBuffer ? g_interpUniformBuffer.Get() : g_betweenPlaceholder.Get();
+  if (!g_drawConstantsBindGroup || g_drawConstantsBetween != between) {
+    const std::array entries{
+        wgpu::BindGroupEntry{.binding = 0, .buffer = g_uniformBuffer},
+        wgpu::BindGroupEntry{.binding = 1,
+                             .buffer = g_interpUniformBuffer ? g_interpUniformBuffer : g_betweenPlaceholder},
+    };
+    const wgpu::BindGroupDescriptor descriptor{
+        .label = "GXCore constants bind group",
+        .layout = g_drawConstantsBindGroupLayout,
+        .entryCount = entries.size(),
+        .entries = entries.data(),
+    };
+    g_drawConstantsBindGroup = g_device.CreateBindGroup(&descriptor);
+    g_drawConstantsBetween = between;
+  }
+  return g_drawConstantsBindGroup;
 }
 
 wgpu::BindGroup find_bind_group(BindGroupRef id) {

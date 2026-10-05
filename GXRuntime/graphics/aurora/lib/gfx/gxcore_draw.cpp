@@ -434,6 +434,9 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
             webgpu::g_dualSourceBlendingSupported,
         "GX destination alpha requires WebGPU dual-source blending");
   std::string wgsl = uber ? gxc::generate_uber_wgsl(key.shader.use_dst_alpha != 0) : gxc::generate_wgsl(key.shader);
+  const bool immediates = immediate_constants();
+  if (immediates)
+    wgsl = gxc::immediate_constants_wgsl(wgsl);
   if (depthOnly) {
     wgsl += "\n@fragment\nfn fs_depth_only() -> @location(0) vec4f {\n"
             "    return vec4f(0.0);\n}\n";
@@ -451,6 +454,8 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   // (g_vertexUniformBindGroupLayout). On the TEV path (S14)
   // 2 = shared dynamic PS uniform and 3 = texture; else 2 = texture. Putting
   // the PS uniform before the texture keeps an untextured TEV draw gap-free.
+  // With immediate constants, 1 = the constant buffers and the PS uniform's
+  // place is an empty group (gxruntime/gxcore/shader.hpp DrawConstants).
   const bool tev = key.shader.tev_valid != 0;
   const bool textured = key.shader.textured != 0;
   // Multi-texmap: the texture group's layout matches the set of texmaps the WGSL
@@ -459,8 +464,9 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   const uint32_t tex_mask = uber ? 0xFFu : textured ? gxc::used_texmap_mask(key.shader) : 1u;
   std::array<wgpu::BindGroupLayout, 4> bindGroupLayouts{
       g_staticBindGroupLayout,
-      g_vertexUniformBindGroupLayout,
-      tev || uber ? g_uniformBindGroupLayout : texture_bind_group_layout(tex_mask),
+      immediates ? g_drawConstantsBindGroupLayout : g_vertexUniformBindGroupLayout,
+      tev || uber ? (immediates ? g_emptyBindGroupLayout : g_uniformBindGroupLayout)
+                  : texture_bind_group_layout(tex_mask),
       texture_bind_group_layout(tex_mask),
   };
   const size_t layoutCount =
@@ -469,6 +475,7 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
       .label = "GXCore Pipeline Layout",
       .bindGroupLayoutCount = layoutCount,
       .bindGroupLayouts = bindGroupLayouts.data(),
+      .immediateSize = immediates ? static_cast<uint32_t>(sizeof(gxc::DrawConstants)) : 0u,
   };
   const auto pipelineLayout = g_device.CreatePipelineLayout(&layoutDescriptor);
 
@@ -727,6 +734,8 @@ struct PassState {
   WGPUBindGroup group2 = nullptr;
   uint32_t offset2 = UINT32_MAX;
   WGPUBindGroup group3 = nullptr;
+  // The immediate data last set (immediate_constants()).
+  gxc::DrawConstants constants{UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
 };
 PassState g_pass;
 } // namespace
@@ -771,12 +780,19 @@ struct DrawPart {
 } // namespace
 
 void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
+  static const bool immediates = immediate_constants();
   const auto bind = [&](PipelineRef ref) {
     if (!bind_pipeline(ref, pass))
       return false;
     if (ref != g_pass.pipeline) {
       g_pass.pipeline = ref;
-      g_pass.group1 = g_pass.group2 = g_pass.group3 = nullptr;
+      // With immediate constants a group is set again only when the draw's is
+      // another: every gxcore pipeline takes the constants group as group 1,
+      // the TEV path's group 2 is the one empty group, and a texture group's
+      // layout is the one its draw's pipeline was made with.
+      if (!immediates)
+        g_pass.group1 = g_pass.group2 = g_pass.group3 = nullptr;
+      g_pass.constants = {UINT32_MAX, UINT32_MAX, UINT32_MAX, UINT32_MAX};
     }
     return true;
   };
@@ -865,6 +881,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     const std::array<uint32_t, 3> offsets{vs.block, vs.matrices, vs.lights};
     if (vsGroup.Get() != g_pass.group1 || offsets != g_pass.offset1) {
       pass.SetBindGroup(1, vsGroup, offsets.size(), offsets.data());
+      ++g_encodeStats.group1;
       g_pass.group1 = vsGroup.Get();
       g_pass.offset1 = offsets;
     }
@@ -879,6 +896,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
       const uint64_t offset = part.verts.offset - back;
       if (g_pass.vertexBuffer != g_interpVertexBuffer.Get() || g_pass.vertexOffset != offset) {
         pass.SetVertexBuffer(0, g_interpVertexBuffer, offset);
+        ++g_encodeStats.vertexBuffers;
         g_pass.vertexBuffer = g_interpVertexBuffer.Get();
         g_pass.vertexOffset = offset;
       }
@@ -887,12 +905,14 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     if (data.vertRange.offset % vertexStride == 0) {
       if (g_pass.vertexBuffer != g_vertexBuffer.Get() || g_pass.vertexOffset != 0) {
         pass.SetVertexBuffer(0, g_vertexBuffer);
+        ++g_encodeStats.vertexBuffers;
         g_pass.vertexBuffer = g_vertexBuffer.Get();
         g_pass.vertexOffset = 0;
       }
       return static_cast<int32_t>(data.vertRange.offset / vertexStride);
     }
     pass.SetVertexBuffer(0, g_vertexBuffer, data.vertRange.offset, data.vertRange.size);
+    ++g_encodeStats.vertexBuffers;
     g_pass.vertexBuffer = g_vertexBuffer.Get();
     g_pass.vertexOffset = data.vertRange.offset;
     return 0;
@@ -909,30 +929,79 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     const uint32_t psOffset = blended ? part.pixel.offset : data.pixelUniformRange.offset;
     if (psGroup.Get() != g_pass.group2 || psOffset != g_pass.offset2) {
       pass.SetBindGroup(2, psGroup, 1, &psOffset);
+      ++g_encodeStats.group2;
       g_pass.group2 = psGroup.Get();
       g_pass.offset2 = psOffset;
     }
   };
+  // With immediate constants: the constants group once a pass, and per part
+  // the rows of its four parts, the in-between buffer's where they were
+  // blended. The pixel row is the draw's own on its depth prepass too, so the
+  // colour draw that follows sets nothing.
+  const wgpu::BindGroup* constantsGroup = immediates ? &draw_constants_bind_group() : nullptr;
+  const auto setConstants = [&](const DrawPart& part) {
+    if (g_pass.group1 != constantsGroup->Get()) {
+      pass.SetBindGroup(1, *constantsGroup);
+      ++g_encodeStats.group1;
+      g_pass.group1 = constantsGroup->Get();
+    }
+    const bool blended = part.uniform.size != 0;
+    const VertexUniformRanges& vs = blended ? part.uniform : data.uniformRange;
+    const uint32_t vsBuffer = blended ? gxc::kConstantsInBetween : 0u;
+    gxc::DrawConstants constants{
+        .block = vs.block / 16u | vsBuffer,
+        .matrices = vs.matrices / 16u | vsBuffer,
+        .lights = vs.lights / 16u | vsBuffer,
+    };
+    if (uberDraw)
+      constants.pixel = data.uberPixelRange.offset / 16u;
+    else if (data.tev)
+      constants.pixel = part.pixel.size != 0 ? part.pixel.offset / 16u | gxc::kConstantsInBetween
+                                             : data.pixelUniformRange.offset / 16u;
+    if (constants != g_pass.constants) {
+      pass.SetImmediates(0, &constants, sizeof(constants));
+      ++g_encodeStats.immediates;
+      g_pass.constants = constants;
+    }
+  };
   const auto draw = [&](bool pixel) {
     for (const DrawPart& part : parts) {
-      setGroup1(part);
-      if (pixel)
-        setGroup2(part);
+      if (immediates) {
+        setConstants(part);
+      } else {
+        setGroup1(part);
+        if (pixel)
+          setGroup2(part);
+      }
       const int32_t baseVertex = setVertices(part);
       pass.DrawIndexed(part.indexCount, 1, part.firstIndex, baseVertex);
+      ++g_encodeStats.draws;
+    }
+  };
+  // The TEV path's group 2 with immediate constants: empty.
+  const auto setEmptyGroup2 = [&] {
+    if (g_pass.group2 != g_emptyBindGroup.Get()) {
+      pass.SetBindGroup(2, g_emptyBindGroup);
+      ++g_encodeStats.group2;
+      g_pass.group2 = g_emptyBindGroup.Get();
+      g_pass.offset2 = UINT32_MAX;
     }
   };
   if (uberDraw) {
     // group 2: the pixel constants and the shader key; group 3: all eight texmaps.
     const uint32_t psOffset = data.uberPixelRange.offset;
-    if (g_uniformBindGroup.Get() != g_pass.group2 || psOffset != g_pass.offset2) {
+    if (immediates) {
+      setEmptyGroup2();
+    } else if (g_uniformBindGroup.Get() != g_pass.group2 || psOffset != g_pass.offset2) {
       pass.SetBindGroup(2, g_uniformBindGroup, 1, &psOffset);
+      ++g_encodeStats.group2;
       g_pass.group2 = g_uniformBindGroup.Get();
       g_pass.offset2 = psOffset;
     }
     const auto& group = find_bind_group(data.uberTextureBindGroup);
     if (group.Get() != g_pass.group3) {
       pass.SetBindGroup(3, group);
+      ++g_encodeStats.group3;
       g_pass.group3 = group.Get();
     }
     draw(false);
@@ -945,10 +1014,13 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   }
   if (data.tev) {
     // group 3 = texture (group 2, the PS uniform, is set for each part).
+    if (immediates)
+      setEmptyGroup2();
     if (data.textureBindGroup != 0) {
       const auto& group = find_bind_group(data.textureBindGroup);
       if (group.Get() != g_pass.group3) {
         pass.SetBindGroup(3, group);
+        ++g_encodeStats.group3;
         g_pass.group3 = group.Get();
       }
     }
@@ -956,6 +1028,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     const auto& group = find_bind_group(data.textureBindGroup);
     if (group.Get() != g_pass.group2 || g_pass.offset2 != UINT32_MAX) {
       pass.SetBindGroup(2, group);
+      ++g_encodeStats.group2;
       g_pass.group2 = group.Get();
       g_pass.offset2 = UINT32_MAX;
     }

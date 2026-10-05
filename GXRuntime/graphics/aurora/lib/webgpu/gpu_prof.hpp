@@ -18,6 +18,8 @@ const wgpu::PassTimestampWrites* pass_writes(std::string_view name);
 // [gpu-prof] lines (KB per frame).
 enum class CopyKind : uint8_t { Vertices, Uniforms, Indices, Storage, Textures, Count };
 void count_copy(CopyKind kind, uint64_t bytes);
+// Copy commands the frame's staging copies record (copies= per frame).
+void count_copy_commands(uint32_t commands);
 
 class Zone {
 public:

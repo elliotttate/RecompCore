@@ -2,11 +2,14 @@
 #include "gxruntime/gxcore/shader.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <string_view>
 
 namespace gxruntime::gxcore {
 
@@ -1206,6 +1209,200 @@ std::string generate_wgsl(const ShaderKey& key) {
   } else {
     emit(out, "    return prev;\n}\n");
   }
+  return out;
+}
+
+// --- Constants from storage, the draw's rows in immediate data ----------------
+
+namespace {
+
+// A constant field the generators read, where it is: its part (the
+// DrawConstants member), its first 16-byte row in that part, its element type,
+// and whether it is indexed. The lights are an array of five-row structs.
+struct ConstantField {
+  const char* binding;
+  const char* name;
+  const char* part;
+  std::uint32_t row;
+  char type; // f, i or u: the load's vec4 type
+  bool indexed;
+};
+
+constexpr std::uint32_t row_of(std::size_t bytes) { return static_cast<std::uint32_t>(bytes / 16u); }
+
+using VSC = VertexShaderConstants;
+using PSC = PixelShaderConstants;
+const ConstantField kConstantFields[] = {
+    {"vsc", "posnormalmatrix", "block", row_of(offsetof(VSC, posnormalmatrix)), 'f', true},
+    {"vsc", "projection", "block", row_of(offsetof(VSC, projection)), 'f', true},
+    {"vsc", "texmatrices", "block", row_of(offsetof(VSC, texmatrices)), 'f', true},
+    {"vsc", "materials", "block", row_of(offsetof(VSC, materials)), 'i', true},
+    {"vsc", "cached_normal", "block", row_of(offsetof(VSC, cached_normal)), 'f', false},
+    {"vsc", "cached_tangent", "block", row_of(offsetof(VSC, cached_tangent)), 'f', false},
+    {"vsc", "cached_binormal", "block", row_of(offsetof(VSC, cached_binormal)), 'f', false},
+    {"vsm", "transformmatrices", "matrices", row_of(offsetof(VSC, transformmatrices) - kVertexMatrixOffset), 'f', true},
+    {"vsm", "normalmatrices", "matrices", row_of(offsetof(VSC, normalmatrices) - kVertexMatrixOffset), 'f', true},
+    {"vsl", "lights", "lights", 0, 'f', true},
+    {"psc", "colors", "pixel", row_of(offsetof(PSC, colors)), 'i', true},
+    {"psc", "kcolors", "pixel", row_of(offsetof(PSC, kcolors)), 'i', true},
+    {"psc", "alpha_ref", "pixel", row_of(offsetof(PSC, alpha_ref)), 'i', false},
+    {"psc", "fogcolor", "pixel", row_of(offsetof(PSC, fogcolor)), 'i', false},
+    {"psc", "fogi", "pixel", row_of(offsetof(PSC, fogi)), 'i', false},
+    {"psc", "fogf", "pixel", row_of(offsetof(PSC, fogf)), 'f', false},
+    {"psc", "fogrange", "pixel", row_of(offsetof(PSC, fogrange)), 'f', true},
+    {"psc", "zbias", "pixel", row_of(offsetof(PSC, zbias)), 'i', false},
+    {"psc", "texdims", "pixel", row_of(offsetof(PSC, texdims)), 'i', true},
+    {"psc", "indtexmtx", "pixel", row_of(offsetof(PSC, indtexmtx)), 'i', true},
+    {"psc", "key", "pixel", row_of(offsetof(UberPixelConstants, key)), 'u', true},
+    {"psc", "extra", "pixel", row_of(offsetof(UberPixelConstants, extra)), 'u', false},
+};
+static_assert(offsetof(UberPixelConstants, psc) == 0);
+
+// GpuLight's members, a row each.
+struct LightMember {
+  const char* name;
+  std::uint32_t row;
+  char type;
+};
+constexpr LightMember kLightMembers[] = {
+    {"color", 0, 'i'}, {"cosatt", 1, 'f'}, {"distatt", 2, 'f'}, {"pos", 3, 'f'}, {"dir", 4, 'f'},
+};
+static_assert(sizeof(GpuLight) == 5 * 16);
+
+// gx_draw.<part> + <row>u: a row of the draw's part.
+std::string fmt_row(const char* part, std::uint32_t row) {
+  return std::string("gx_draw.") + part + " + " + std::to_string(row) + "u";
+}
+
+bool ident_char(char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; }
+
+std::size_t ident_end(std::string_view s, std::size_t at) {
+  while (at < s.size() && ident_char(s[at]))
+    ++at;
+  return at;
+}
+
+// The index of the bracket at `open`'s match, or npos.
+std::size_t matching_bracket(std::string_view s, std::size_t open) {
+  int depth = 0;
+  for (std::size_t i = open; i < s.size(); ++i) {
+    if (s[i] == '[')
+      ++depth;
+    else if (s[i] == ']' && --depth == 0)
+      return i;
+  }
+  return std::string_view::npos;
+}
+
+std::string rewrite_reads(std::string_view s) {
+  std::string out;
+  out.reserve(s.size() + s.size() / 2);
+  std::size_t i = 0;
+  while (i < s.size()) {
+    const ConstantField* field = nullptr;
+    std::size_t nameEnd = 0;
+    if (s.size() - i > 4 && s[i + 3] == '.' && (i == 0 || !ident_char(s[i - 1]))) {
+      const std::string_view binding = s.substr(i, 3);
+      nameEnd = ident_end(s, i + 4);
+      const std::string_view name = s.substr(i + 4, nameEnd - (i + 4));
+      for (const ConstantField& f : kConstantFields)
+        if (binding == f.binding && name == f.name)
+          field = &f;
+    }
+    if (field == nullptr) {
+      out += s[i++];
+      continue;
+    }
+    char type = field->type;
+    std::string row = fmt_row(field->part, field->row);
+    std::size_t next = nameEnd;
+    if (field->indexed && next < s.size() && s[next] == '[') {
+      const std::size_t close = matching_bracket(s, next);
+      if (close == std::string_view::npos) {
+        out += s[i++];
+        continue;
+      }
+      const std::string index = rewrite_reads(s.substr(next + 1, close - next - 1));
+      next = close + 1;
+      if (std::strcmp(field->name, "lights") == 0) {
+        // vsl.lights[i].member
+        if (next >= s.size() || s[next] != '.') {
+          out += s[i++];
+          continue;
+        }
+        const std::size_t memberEnd = ident_end(s, next + 1);
+        const std::string_view member = s.substr(next + 1, memberEnd - next - 1);
+        const LightMember* light = nullptr;
+        for (const LightMember& m : kLightMembers)
+          if (member == m.name)
+            light = &m;
+        if (light == nullptr) {
+          out += s[i++];
+          continue;
+        }
+        type = light->type;
+        row = fmt_row(field->part, light->row) + " + u32(" + index + ") * 5u";
+        next = memberEnd;
+      } else {
+        row += " + u32(" + index + ")";
+      }
+    }
+    out += "gx_ld";
+    out += type;
+    out += '(';
+    out += row;
+    out += ')';
+    i = next;
+  }
+  return out;
+}
+
+} // namespace
+
+std::string immediate_constants_wgsl(std::string_view wgsl) {
+  // The four parts' bindings go; their struct declarations stay, unused.
+  std::string body;
+  body.reserve(wgsl.size());
+  std::size_t directivesEnd = 0;
+  std::size_t at = 0;
+  bool leading = true;
+  while (at < wgsl.size()) {
+    std::size_t end = wgsl.find('\n', at);
+    end = end == std::string_view::npos ? wgsl.size() : end + 1;
+    const std::string_view line = wgsl.substr(at, end - at);
+    const bool binding = line.find("var<uniform> vsc:") != std::string_view::npos ||
+                         line.find("var<uniform> vsm:") != std::string_view::npos ||
+                         line.find("var<uniform> vsl:") != std::string_view::npos ||
+                         line.find("var<uniform> psc:") != std::string_view::npos;
+    if (!binding)
+      body += line;
+    if (leading) {
+      if (line.starts_with("enable ") || line.starts_with("requires ") || line.starts_with("diagnostic") ||
+          line == "\n")
+        directivesEnd = body.size();
+      else
+        leading = false;
+    }
+    at = end;
+  }
+  std::string out = body.substr(0, directivesEnd);
+  out += "struct GxDrawConstants {\n"
+         "    block: u32,\n"
+         "    matrices: u32,\n"
+         "    lights: u32,\n"
+         "    pixel: u32,\n"
+         "};\n"
+         "var<immediate> gx_draw: GxDrawConstants;\n"
+         "@group(1) @binding(0) var<storage, read> gx_frame_constants: array<vec4u>;\n"
+         "@group(1) @binding(1) var<storage, read> gx_between_constants: array<vec4u>;\n"
+         "fn gx_ld(row: u32) -> vec4u {\n"
+         "    if (row >= 0x80000000u) { return gx_between_constants[row - 0x80000000u]; }\n"
+         "    return gx_frame_constants[row];\n"
+         "}\n"
+         "fn gx_ldf(row: u32) -> vec4f { return bitcast<vec4f>(gx_ld(row)); }\n"
+         "fn gx_ldi(row: u32) -> vec4i { return bitcast<vec4i>(gx_ld(row)); }\n"
+         "fn gx_ldu(row: u32) -> vec4u { return gx_ld(row); }\n";
+  out += rewrite_reads(std::string_view(body).substr(directivesEnd));
   return out;
 }
 

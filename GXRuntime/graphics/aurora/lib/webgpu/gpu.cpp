@@ -866,9 +866,15 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
   {
     wgpu::Limits supportedLimits{};
     g_adapter.GetLimits(&supportedLimits);
+    // Four storage buffers a stage where the adapter has them: the static
+    // group's two and gxcore's constants (gfx/common.cpp, immediate_constants()).
+    const uint32_t storageBuffers = supportedLimits.maxStorageBuffersPerShaderStage >= 4 &&
+                                            supportedLimits.maxStorageBuffersPerShaderStage != WGPU_LIMIT_U32_UNDEFINED
+                                        ? 4u
+                                        : 2u;
     wgpu::CompatibilityModeLimits compatibilityModeLimits{wgpu::CompatibilityModeLimits::Init{
-        .maxStorageBuffersInVertexStage = 2,
-        .maxStorageBuffersInFragmentStage = 2,
+        .maxStorageBuffersInVertexStage = storageBuffers,
+        .maxStorageBuffersInFragmentStage = storageBuffers,
     }};
     const wgpu::Limits requiredLimits{
         .nextInChain = &compatibilityModeLimits,
@@ -881,11 +887,20 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
                                                                             : supportedLimits.maxTextureDimension3D,
         .maxTextureArrayLayers = supportedLimits.maxTextureArrayLayers == 0 ? WGPU_LIMIT_U32_UNDEFINED
                                                                             : supportedLimits.maxTextureArrayLayers,
-        .maxStorageBuffersPerShaderStage = 2,
+        .maxStorageBuffersPerShaderStage = storageBuffers,
+        // gxcore's constants as storage: the in-between frames' buffer reaches
+        // 224 MB (gfx/common.cpp, immediate_constants()).
+        .maxStorageBufferBindingSize = supportedLimits.maxStorageBufferBindingSize,
         .minUniformBufferOffsetAlignment =
             supportedLimits.minUniformBufferOffsetAlignment < 64 ? 64 : supportedLimits.minUniformBufferOffsetAlignment,
         .minStorageBufferOffsetAlignment =
             supportedLimits.minStorageBufferOffsetAlignment < 16 ? 16 : supportedLimits.minStorageBufferOffsetAlignment,
+        // A draw's rows of those constants (gxruntime/gxcore/shader.hpp
+        // DrawConstants).
+        .maxImmediateSize = supportedLimits.maxImmediateSize >= 16 &&
+                                    supportedLimits.maxImmediateSize != WGPU_LIMIT_U32_UNDEFINED
+                                ? 16u
+                                : WGPU_LIMIT_U32_UNDEFINED,
     };
     Log.info(
         "Using limits:"

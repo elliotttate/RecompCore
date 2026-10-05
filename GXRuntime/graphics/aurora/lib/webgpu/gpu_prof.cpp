@@ -183,6 +183,7 @@ double g_logFrameMax = 0.0;
 double g_logBusyMs = 0.0;
 absl::flat_hash_map<std::string, LogKind> g_logKinds;
 uint64_t g_logBytes[static_cast<size_t>(CopyKind::Count)] = {};
+uint64_t g_logCopies = 0;
 
 std::string_view log_kind(std::string_view name) {
   size_t end = name.size();
@@ -234,6 +235,7 @@ void log_frame(const Slot& slot, const uint64_t* ts, uint64_t frameBegin, uint64
                double(g_logBytes[0]) / 1024.0 / frames, double(g_logBytes[1]) / 1024.0 / frames,
                double(g_logBytes[2]) / 1024.0 / frames, double(g_logBytes[3]) / 1024.0 / frames,
                double(g_logBytes[4]) / 1024.0 / frames);
+  std::fprintf(stderr, " copies=%.0f", double(g_logCopies) / frames);
   for (size_t i = 0; i < kinds.size() && i < 12; ++i) {
     std::fprintf(stderr, " | %s %.3f x%.1f", kinds[i].first.c_str(), kinds[i].second.ms / frames,
                  double(kinds[i].second.count) / frames);
@@ -244,6 +246,7 @@ void log_frame(const Slot& slot, const uint64_t* ts, uint64_t frameBegin, uint64
   g_logFrameMax = 0.0;
   g_logBusyMs = 0.0;
   g_logKinds.clear();
+  g_logCopies = 0;
   for (auto& bytes : g_logBytes) {
     bytes = 0;
   }
@@ -533,6 +536,12 @@ const wgpu::PassTimestampWrites* pass_writes(std::string_view name) {
 void count_copy(CopyKind kind, uint64_t bytes) {
   if (g_log) {
     g_logBytes[static_cast<size_t>(kind)] += bytes;
+  }
+}
+
+void count_copy_commands(uint32_t commands) {
+  if (g_log) {
+    g_logCopies += commands;
   }
 }
 

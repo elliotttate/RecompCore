@@ -2189,9 +2189,48 @@ void test_efb_copy_sink() {
   }
 }
 
+// The immediate-constants form (shader.hpp immediate_constants_wgsl) of the
+// ubershader, which reads every constant field, and of the golden module: no
+// read or binding of the four parts is left, the declarations follow the
+// directives, and known reads land on their parts' rows.
+void test_immediate_constants() {
+  const std::string modules[] = {gxc::generate_uber_wgsl(false), gxc::generate_uber_wgsl(true),
+                                 kGoldenTexturedWgsl};
+  for (const std::string& wgsl : modules) {
+    const std::string out = gxc::immediate_constants_wgsl(wgsl);
+    for (const char* gone : {"vsc.", "vsm.", "vsl.", "psc.", "var<uniform>"}) {
+      if (out.find(gone) != std::string::npos)
+        std::fprintf(stderr, "immediate constants: %s left\n", gone);
+      CHECK(out.find(gone) == std::string::npos);
+    }
+    const std::size_t immediate = out.find("var<immediate> gx_draw: GxDrawConstants;");
+    CHECK(immediate != std::string::npos);
+    const std::size_t enable = out.find("enable dual_source_blending;");
+    CHECK(enable == std::string::npos || enable < immediate);
+  }
+  const std::string uber = gxc::immediate_constants_wgsl(gxc::generate_uber_wgsl(false));
+  for (const char* read : {
+           "gx_ldi(gx_draw.pixel + 8u).x",                              // psc.alpha_ref.x
+           "gx_ldf(gx_draw.lights + 3u + u32(i) * 5u).xyz",             // vsl.lights[i].pos.xyz
+           "gx_ldi(gx_draw.lights + 0u + u32(i) * 5u).rgb",             // vsl.lights[i].color.rgb
+           "gx_ldf(gx_draw.block + 38u).xyz",                           // vsc.cached_normal.xyz
+           "gx_ldf(gx_draw.matrices + 64u + u32(normidx))",             // vsm.normalmatrices[normidx]
+           "gx_ldi(gx_draw.block + 34u + u32(j + 2u))",                 // vsc.materials[j + 2u]
+           "gx_ldu(gx_draw.pixel + 30u + u32(off >> 4u))[(off >> 2u) & 3u]", // psc.key[...][...]
+           "gx_ldf(gx_draw.pixel + 12u + u32(indexlower >> 2u))[indexlower & 3u]",
+       }) {
+    if (uber.find(read) == std::string::npos)
+      std::fprintf(stderr, "immediate constants: no %s\n", read);
+    CHECK(uber.find(read) != std::string::npos);
+  }
+  const std::string golden = gxc::immediate_constants_wgsl(kGoldenTexturedWgsl);
+  CHECK(golden.find("gx_ldf(gx_draw.block + 6u + u32(0))") != std::string::npos); // vsc.projection[0]
+}
+
 } // namespace
 
 int main() {
+  test_immediate_constants();
   test_state_to_plan_and_wgsl();
   test_untextured_defaults();
   test_texgen_color();
