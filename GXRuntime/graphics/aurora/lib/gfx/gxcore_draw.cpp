@@ -17,6 +17,7 @@
 #include <absl/container/flat_hash_map.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <atomic>
 #include <cmath>
@@ -301,7 +302,48 @@ struct TextureAddressState {
   // worker's time on Outset); empty once that entry is evicted.
   TextureHandle handle;
 };
-absl::flat_hash_map<uint32_t, TextureAddressState> g_textureAddrKey;
+// The identities cached at one guest address, at most two. With one, a CI
+// texture drawn under two palettes evicted itself on every alternation and was
+// decoded and uploaded again each time: Wind Waker's 256x512 CI8 at 0x00FB53A0
+// near Dragon Roost alternates TLUTs 0x00FB5200 and 0x00FB5060, about 68 decodes
+// and 512 KB uploads a second. A third identity replaces the less recent.
+struct TextureAddressSlots {
+  std::array<TextureAddressState, 2> slot;
+  uint8_t used = 0;
+  uint8_t recent = 0;
+};
+absl::flat_hash_map<uint32_t, TextureAddressSlots> g_textureAddrKey;
+
+bool same_texture_identity(const TextureKey& a, const TextureKey& b) {
+  return a.address == b.address && a.size == b.size && a.format == b.format &&
+         a.width == b.width && a.height == b.height && a.tlut_address == b.tlut_address &&
+         a.tlut_format == b.tlut_format && a.tlut_entries == b.tlut_entries;
+}
+
+// Records `state` at `address`: in the slot holding its identity, else a free
+// slot, else the less recent one. The entry a slot stops naming leaves the
+// cache, so it stays bounded to two live entries per buffer.
+void store_texture_state(uint32_t address, const TextureAddressState& state) {
+  TextureAddressSlots& slots = g_textureAddrKey[address];
+  unsigned at = slots.used;
+  for (unsigned i = 0; i < slots.used; ++i)
+    if (same_texture_identity(slots.slot[i].key, state.key)) {
+      at = i;
+      break;
+    }
+  const bool replacing = at < slots.used || slots.used == slots.slot.size();
+  if (at == slots.used) {
+    if (slots.used < slots.slot.size())
+      ++slots.used;
+    else
+      at = slots.recent ^ 1u;
+  }
+  TextureAddressState& slot = slots.slot[at];
+  if (replacing && !(slot.key == state.key))
+    g_textureCache.erase(slot.key);
+  slot = state;
+  slots.recent = static_cast<uint8_t>(at);
+}
 // Counts presented frames; a small texture is re-hashed at most once in each.
 std::atomic<uint64_t> g_textureVerifyFrame{0};
 // A small texture is re-hashed even when its dirty epoch has not moved: the
@@ -1624,26 +1666,33 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         tlutSize == 0u ||
         (g_textureDirtyEpochObserver != nullptr &&
          g_textureDirtyEpochObserver(tlut_address, tlutSize, &tlutEpoch));
-    auto addrIt = g_textureAddrKey.find(address);
-    if (texelEpochValid && tlutEpochValid && addrIt != g_textureAddrKey.end()) {
-      const TextureAddressState& previous = addrIt->second;
+    // This identity's state at the address, if it has one.
+    TextureAddressState* state = nullptr;
+    const auto slotsIt = g_textureAddrKey.find(address);
+    if (slotsIt != g_textureAddrKey.end()) {
+      TextureAddressSlots& slots = slotsIt->second;
+      const TextureKey identity{address,      tsize,       format,       width, height,
+                                tlut_address, tlut_format, tlut_entries, 0u};
+      for (unsigned i = 0; i < slots.used; ++i)
+        if (same_texture_identity(slots.slot[i].key, identity)) {
+          state = &slots.slot[i];
+          slots.recent = static_cast<uint8_t>(i);
+          break;
+        }
+    }
+    if (texelEpochValid && tlutEpochValid && state != nullptr) {
+      TextureAddressState& previous = *state;
       const TextureKey& priorKey = previous.key;
-      const bool sameIdentity =
-          priorKey.address == address && priorKey.size == tsize &&
-          priorKey.format == format && priorKey.width == width &&
-          priorKey.height == height && priorKey.tlut_address == tlut_address &&
-          priorKey.tlut_format == tlut_format &&
-          priorKey.tlut_entries == tlut_entries;
       const uint64_t frame = g_textureVerifyFrame.load(std::memory_order_relaxed);
       bool small_changed = false;
-      if (sameIdentity && size <= kAlwaysRehashBytes && previous.verified_frame != frame) {
+      if (size <= kAlwaysRehashBytes && previous.verified_frame != frame) {
         const uint64_t h = small_texture_hash(bytes, size, tlut_data, tlutSize);
         if (h != previous.small_hash)
           small_changed = true;
         else
-          addrIt->second.verified_frame = frame;
+          previous.verified_frame = frame;
       }
-      if (sameIdentity && !small_changed && previous.texel_epoch_valid &&
+      if (!small_changed && previous.texel_epoch_valid &&
           previous.tlut_epoch_valid && previous.texel_epoch == texelEpoch &&
           previous.tlut_epoch == tlutEpoch) {
         const TextureHandle* cached = previous.handle ? &previous.handle : nullptr;
@@ -1692,17 +1741,17 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     auto it = g_textureCache.find(key);
     if (it != g_textureCache.end()) {
       ++g_textureCacheStats.hits;
-      g_textureAddrKey[address] = TextureAddressState{
+      const TextureHandle handle = it->second;
+      store_texture_state(address, TextureAddressState{
           key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid,
-          small_hash, verify_frame, it->second};
-      return it->second;
+          small_hash, verify_frame, handle});
+      return handle;
     }
-    // New content for this identity: evict any prior entry cached at the same
-    // guest address (its buffer was overwritten) to keep the cache bounded.
-    addrIt = g_textureAddrKey.find(address);
-    if (addrIt != g_textureAddrKey.end()) {
-      g_textureCache.erase(addrIt->second.key);
-      addrIt->second.handle = {};
+    // New content for this identity: evict its prior entry (the buffer was
+    // overwritten) to keep the cache bounded.
+    if (state != nullptr) {
+      g_textureCache.erase(state->key);
+      state->handle = {};
     }
     // HD texture packs (Dolphin's tex1_WxH_hash[_tlut]_fmt names): the first
     // time these guest bytes are seen, look for a replacement before decoding.
@@ -1729,9 +1778,9 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                        s_replaced, address, format, width, height, (*replacement)->size.width,
                        (*replacement)->size.height);
         g_textureCache.emplace(key, *replacement);
-        g_textureAddrKey[address] = TextureAddressState{
+        store_texture_state(address, TextureAddressState{
             key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid,
-            small_hash, verify_frame, *replacement};
+            small_hash, verify_frame, *replacement});
         return *replacement;
       }
       if (replacementPending) {
@@ -1759,12 +1808,12 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         std::fprintf(stderr, "[tex-upload] addr=%08X fmt=%u %ux%u size=%u efb=%d prior=%d tlut=%08X hash=%016llX pfmt=%u p%ux%u psize=%u\n",
                      address, format, width, height, tsize,
                      g_efbCopyTextures.find(address) != g_efbCopyTextures.end() ? 1 : 0,
-                     addrIt != g_textureAddrKey.end() ? 1 : 0, tlut_address,
+                     slotsIt != g_textureAddrKey.end() ? 1 : 0, tlut_address,
                      (unsigned long long)content_hash,
-                     addrIt != g_textureAddrKey.end() ? addrIt->second.key.format : 0u,
-                     addrIt != g_textureAddrKey.end() ? addrIt->second.key.width : 0u,
-                     addrIt != g_textureAddrKey.end() ? addrIt->second.key.height : 0u,
-                     addrIt != g_textureAddrKey.end() ? addrIt->second.key.size : 0u);
+                     state != nullptr ? state->key.format : 0u,
+                     state != nullptr ? state->key.width : 0u,
+                     state != nullptr ? state->key.height : 0u,
+                     state != nullptr ? state->key.size : 0u);
     }
     {
       // DOL_GXCORE_DUMP_TEX=<hex address>: write the decoded RGBA of that
@@ -1808,9 +1857,9 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       return handle;
     }
     g_textureCache.emplace(key, handle);
-    g_textureAddrKey[address] = TextureAddressState{
+    store_texture_state(address, TextureAddressState{
         key, texelEpoch, tlutEpoch, texelEpochValid, tlutEpochValid,
-        small_hash, verify_frame, handle};
+        small_hash, verify_frame, handle});
     return handle;
   };
 
