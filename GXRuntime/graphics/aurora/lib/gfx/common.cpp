@@ -1835,6 +1835,12 @@ static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& f
   }
   const webgpu::gpu_prof::Zone zone{cmd, "Staging copies"};
   const auto& highWater = op.highWater;
+  using webgpu::gpu_prof::CopyKind;
+  const auto delta = [](uint64_t highWater, uint64_t copied) { return highWater > copied ? highWater - copied : 0; };
+  webgpu::gpu_prof::count_copy(CopyKind::Vertices, delta(highWater.verts, frame.copied.verts));
+  webgpu::gpu_prof::count_copy(CopyKind::Uniforms, delta(highWater.uniforms, frame.copied.uniforms));
+  webgpu::gpu_prof::count_copy(CopyKind::Indices, delta(highWater.indices, frame.copied.indices));
+  webgpu::gpu_prof::count_copy(CopyKind::Storage, delta(highWater.storage, frame.copied.storage));
   copy_staging_buffer_range(cmd, frame, frame.copied.verts, highWater.verts, VertexStagingOffset, g_vertexBuffer);
   copy_staging_buffer_range(cmd, frame, frame.copied.uniforms, highWater.uniforms, UniformStagingOffset,
                             g_uniformBuffer);
@@ -1855,6 +1861,7 @@ static void copy_staging_to_high_water(wgpu::CommandEncoder& cmd, FramePacket& f
       };
       cmd.CopyBufferToTexture(&buf, &item.tex, &item.size);
     }
+    webgpu::gpu_prof::count_copy(CopyKind::Textures, delta(highWater.textureUpload, frame.copied.textureUpload));
     frame.copied.textureUpload = highWater.textureUpload;
     frame.copied.textureUploadCount = op.textureUploads.size();
   }

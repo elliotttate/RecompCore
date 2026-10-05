@@ -951,11 +951,18 @@ bool initialize(AuroraBackend auroraBackend, bool allowCpu) {
         }
       }
 #endif
-#ifdef TRACY_ENABLE
+      // Timestamps for the GPU profiler (gpu_prof.cpp): Tracy builds, and
+      // DOL_AURORA_GPU_PROF=1, which logs each pass's GPU time to stderr.
       if (feature == wgpu::FeatureName::TimestampQuery) {
+#ifdef TRACY_ENABLE
         requiredFeatures.push_back(feature);
-      }
+#else
+        const char* profEnv = std::getenv("DOL_AURORA_GPU_PROF");
+        if (profEnv != nullptr && profEnv[0] == '1') {
+          requiredFeatures.push_back(feature);
+        }
 #endif
+      }
     }
     std::string featureList;
     for (auto featureName : requiredFeatures) {

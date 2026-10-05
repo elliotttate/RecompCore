@@ -14,6 +14,11 @@ void frame_end(const wgpu::CommandEncoder& encoder);
 void after_submit();
 const wgpu::PassTimestampWrites* pass_writes(std::string_view name);
 
+// Bytes the frame's staging copies move, by kind, for DOL_AURORA_GPU_PROF's
+// [gpu-prof] lines (KB per frame).
+enum class CopyKind : uint8_t { Vertices, Uniforms, Indices, Storage, Textures, Count };
+void count_copy(CopyKind kind, uint64_t bytes);
+
 class Zone {
 public:
   Zone(const wgpu::CommandEncoder& encoder, std::string_view name);

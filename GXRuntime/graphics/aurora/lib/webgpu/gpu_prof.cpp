@@ -6,8 +6,11 @@
 #include <tracy/Tracy.hpp>
 
 #ifdef TRACY_ENABLE
-
 #include <tracy/TracyC.h>
+#endif
+
+#include <cstdio>
+#include <cstdlib>
 
 #include <algorithm>
 #include <array>
@@ -107,6 +110,7 @@ const char* intern_name(std::string_view name) {
   return stable;
 }
 
+#ifdef TRACY_ENABLE
 // tracy::GpuContextType not exposed through TracyC.h
 uint8_t tracy_context_type(wgpu::BackendType backend) {
   switch (backend) {
@@ -162,6 +166,89 @@ void emit_zone_end(uint64_t gpuNs) {
   ___tracy_emit_gpu_time_serial({.gpuTime = int64_t(gpuNs), .queryId = queryId, .context = ContextId});
 }
 
+#endif
+
+// DOL_AURORA_GPU_PROF=1, without Tracy: each pass's and zone's GPU time, summed
+// by kind ("Render pass 12" counts as "Render pass") over a window of
+// frames, and the frames' GPU time, written to stderr as [gpu-prof] lines.
+struct LogKind {
+  double ms = 0.0;
+  uint64_t count = 0;
+};
+constexpr uint32_t LogWindow = 240;
+bool g_log = false;
+uint32_t g_logFrames = 0;
+double g_logFrameMs = 0.0;
+double g_logFrameMax = 0.0;
+double g_logBusyMs = 0.0;
+absl::flat_hash_map<std::string, LogKind> g_logKinds;
+uint64_t g_logBytes[static_cast<size_t>(CopyKind::Count)] = {};
+
+std::string_view log_kind(std::string_view name) {
+  size_t end = name.size();
+  while (end > 0 && name[end - 1] >= '0' && name[end - 1] <= '9') {
+    --end;
+  }
+  while (end > 0 && name[end - 1] == ' ') {
+    --end;
+  }
+  return end == 0 ? name : name.substr(0, end);
+}
+
+void log_frame(const Slot& slot, const uint64_t* ts, uint64_t frameBegin, uint64_t frameEnd) {
+  double busy = 0.0;
+  uint32_t depth = 0;
+  for (const auto& event : slot.events) {
+    if (event.kind == EventKind::End) {
+      if (depth != 0) {
+        --depth;
+      }
+      continue;
+    }
+    const uint64_t begin = ts[event.query];
+    const uint64_t end = ts[event.query + 1];
+    if (begin != 0 && end > begin) {
+      const double ms = double(end - begin) * 1e-6;
+      auto& kind = g_logKinds[std::string(log_kind(event.name))];
+      kind.ms += ms;
+      ++kind.count;
+      if (depth == 0) {
+        busy += ms;
+      }
+    }
+    ++depth;
+  }
+  const double frameMs = double(frameEnd - frameBegin) * 1e-6;
+  g_logFrameMs += frameMs;
+  g_logFrameMax = std::max(g_logFrameMax, frameMs);
+  g_logBusyMs += busy;
+  if (++g_logFrames < LogWindow) {
+    return;
+  }
+  std::vector<std::pair<std::string, LogKind>> kinds(g_logKinds.begin(), g_logKinds.end());
+  std::sort(kinds.begin(), kinds.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+  const double frames = double(g_logFrames);
+  std::fprintf(stderr, "[gpu-prof] frames=%u frame_ms=%.3f max=%.3f busy_ms=%.3f", g_logFrames,
+               g_logFrameMs / frames, g_logFrameMax, g_logBusyMs / frames);
+  std::fprintf(stderr, " copy_kb verts=%.0f uniforms=%.0f indices=%.0f storage=%.0f textures=%.0f",
+               double(g_logBytes[0]) / 1024.0 / frames, double(g_logBytes[1]) / 1024.0 / frames,
+               double(g_logBytes[2]) / 1024.0 / frames, double(g_logBytes[3]) / 1024.0 / frames,
+               double(g_logBytes[4]) / 1024.0 / frames);
+  for (size_t i = 0; i < kinds.size() && i < 12; ++i) {
+    std::fprintf(stderr, " | %s %.3f x%.1f", kinds[i].first.c_str(), kinds[i].second.ms / frames,
+                 double(kinds[i].second.count) / frames);
+  }
+  std::fputc('\n', stderr);
+  g_logFrames = 0;
+  g_logFrameMs = 0.0;
+  g_logFrameMax = 0.0;
+  g_logBusyMs = 0.0;
+  g_logKinds.clear();
+  for (auto& bytes : g_logBytes) {
+    bytes = 0;
+  }
+}
+
 TimestampBounds event_bounds(const Slot& slot, const uint64_t* ts) {
   TimestampBounds bounds;
   for (const auto& event : slot.events) {
@@ -198,7 +285,11 @@ void emit_frame(Slot& slot) {
   if (frameBegin == 0 || frameEnd <= frameBegin) {
     return;
   }
+  if (g_log) {
+    log_frame(slot, ts, frameBegin, frameEnd);
+  }
 
+#ifdef TRACY_ENABLE
   const uint64_t lastFrameEnd = std::exchange(g_lastFrameEnd, frameEnd);
   if (lastFrameEnd != 0) {
     if (frameBegin < lastFrameEnd) {
@@ -277,6 +368,7 @@ void emit_frame(Slot& slot) {
   TracyPlot("aurora: gpuFrameMs", double(frameEnd - frameBegin) * 1e-6);
   TracyPlot("aurora: gpuIdleMs", double(idleNs) * 1e-6);
   TracyPlot("aurora: gpuPasses", int64_t(slot.passCount));
+#endif
 }
 
 Slot& record_slot() { return g_slots[g_recordSlot]; }
@@ -296,6 +388,8 @@ void initialize() {
     return;
   }
   g_timestampsEnabled = true; // TODO: check if allow_unsafe_apis enabled?
+  const char* logEnv = std::getenv("DOL_AURORA_GPU_PROF");
+  g_log = logEnv != nullptr && logEnv[0] == '1';
   constexpr wgpu::QuerySetDescriptor querySetDescriptor{
       .label = "GPU profiler timestamps",
       .type = wgpu::QueryType::Timestamp,
@@ -321,9 +415,11 @@ void initialize() {
   g_recordSlot = 0;
   g_emitSlot = 0;
   g_framePending = false;
+#ifdef TRACY_ENABLE
   TracyPlotConfig("aurora: gpuFrameMs", tracy::PlotFormatType::Number, false, true, 0);
   TracyPlotConfig("aurora: gpuIdleMs", tracy::PlotFormatType::Number, false, true, 0);
   TracyPlotConfig("aurora: gpuPasses", tracy::PlotFormatType::Number, true, true, 0);
+#endif
   Log.info("GPU profiling enabled ({} zones max)", MaxZones);
 }
 
@@ -434,6 +530,12 @@ const wgpu::PassTimestampWrites* pass_writes(std::string_view name) {
   return &out;
 }
 
+void count_copy(CopyKind kind, uint64_t bytes) {
+  if (g_log) {
+    g_logBytes[static_cast<size_t>(kind)] += bytes;
+  }
+}
+
 Zone::Zone(const wgpu::CommandEncoder& encoder, std::string_view name) {
   if (!g_timestampsEnabled) {
     return;
@@ -457,18 +559,3 @@ Zone::~Zone() {
 }
 
 } // namespace aurora::webgpu::gpu_prof
-
-#else
-
-namespace aurora::webgpu::gpu_prof {
-void initialize() {}
-void shutdown() {}
-void frame_begin(const wgpu::CommandEncoder&) {}
-void frame_end(const wgpu::CommandEncoder&) {}
-void after_submit() {}
-const wgpu::PassTimestampWrites* pass_writes(std::string_view) { return nullptr; }
-Zone::Zone(const wgpu::CommandEncoder&, std::string_view) {}
-Zone::~Zone() = default;
-} // namespace aurora::webgpu::gpu_prof
-
-#endif
