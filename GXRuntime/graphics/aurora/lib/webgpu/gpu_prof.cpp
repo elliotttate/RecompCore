@@ -31,7 +31,7 @@ Module Log("aurora::webgpu::gpu_prof");
 
 // Each zone consumes a begin/end timestamp pair.
 // The last pair is reserved for the frame zone.
-constexpr uint32_t MaxZones = 127;
+constexpr uint32_t MaxZones = 1023;
 constexpr uint32_t QueryCount = MaxZones * 2 + 2;
 constexpr uint32_t FrameBeginQuery = MaxZones * 2;
 constexpr uint32_t FrameEndQuery = MaxZones * 2 + 1;
