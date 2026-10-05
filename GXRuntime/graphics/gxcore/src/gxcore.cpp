@@ -1321,10 +1321,15 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     return skip("unsupported or empty primitive");
   }
 
-  // Vertex decode to the fixed layout.
+  // Vertex decode, in the compact or the full layout (shader.hpp): the key
+  // made from this draw's format decides, as it decides the pipeline's vertex
+  // state.
+  const bool full_layout = vertex_layout_full(plan.pipeline.shader);
+  const std::uint32_t vertex_floats = full_layout ? kFullVertexFloats : kCompactVertexFloats;
   plan.vertex_count = draw.vertex_count;
+  plan.vertex_floats = vertex_floats;
   plan.vertices.assign(
-      static_cast<std::size_t>(draw.vertex_count) * kVertexFloats, 0.f);
+      static_cast<std::size_t>(draw.vertex_count) * vertex_floats, 0.f);
   const std::uint8_t* payload = draw.vertex_payload.data();
   const std::size_t payload_size = draw.vertex_payload.size();
   // Each indexed entry's array, found once for the draw (it was looked up
@@ -1341,10 +1346,15 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
   }
   for (std::uint32_t v = 0; v < draw.vertex_count; ++v) {
     float* out_vertex = plan.vertices.data() +
-                        static_cast<std::size_t>(v) * kVertexFloats;
+                        static_cast<std::size_t>(v) * vertex_floats;
     // Defaults: color0/1 white, uv 0, posmtx = current matrix's first row.
-    out_vertex[4] = out_vertex[5] = out_vertex[6] = out_vertex[7] = 1.f;
-    out_vertex[8] = out_vertex[9] = out_vertex[10] = out_vertex[11] = 1.f;
+    // (A compact draw's pipeline reads color1's white from the default stream.)
+    float* const color0 = out_vertex + kVertexColor0Offset / 4u;
+    color0[0] = color0[1] = color0[2] = color0[3] = 1.f;
+    if (full_layout) {
+      float* const color1 = out_vertex + kVertexColor1Offset / 4u;
+      color1[0] = color1[1] = color1[2] = color1[3] = 1.f;
+    }
     // NBT part ordinal for index3 (three separate normal/binormal/tangent
     // entries); a single 9-component entry decodes all three at once.
     std::uint32_t normal_part = 0;
@@ -1423,16 +1433,20 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
       case WalkEntry::kColor: {
         float rgba[4];
         decode_color(element, entry.format, rgba);
-        float* dst = out_vertex + (entry.out_slot == 0u ? 4u : 8u);
-        for (int c = 0; c < 4; ++c)
-          dst[c] = rgba[c];
+        // color1 is only in the full layout, which a format with it gets.
+        if (entry.out_slot == 0u || full_layout) {
+          float* dst = out_vertex + (entry.out_slot == 0u ? kVertexColor0Offset : kVertexColor1Offset) / 4u;
+          for (int c = 0; c < 4; ++c)
+            dst[c] = rgba[c];
+        }
         break;
       }
       case WalkEntry::kTex: {
-        if (entry.out_slot < kMaxTexGens) {
+        // uv2-4 are only in the full layout, which a format with them gets.
+        if (entry.out_slot < kMaxTexGens && (entry.out_slot < 2u || full_layout)) {
           std::uint32_t scalar = 0;
           component_scalar_size(entry.format, &scalar);
-          float* dst = out_vertex + 12u + 2u * entry.out_slot;
+          float* dst = out_vertex + vertex_uv_offset(entry.out_slot) / 4u;
           const float scale = entry_scales[e];
           dst[0] = decode_scaled(element, entry.format, scale);
           dst[1] = entry.count == 2u
@@ -1449,6 +1463,10 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
         component_scalar_size(entry.format, &scalar);
         const float scale = entry_scales[e];
         auto decode3 = [&](const std::uint8_t* src, std::uint32_t dst_off) {
+          // Binormal and tangent are in the full layout only (N/B/T makes a
+          // draw full).
+          if (dst_off >= kCompactVertexStrideBytes && !full_layout)
+            return;
           float* dst = out_vertex + dst_off / 4u;
           for (std::uint32_t c = 0; c < 3u; ++c)
             dst[c] = decode_scaled(src + c * scalar, entry.format, scale);
@@ -1474,11 +1492,15 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
         break;
       }
     }
-    std::memcpy(out_vertex + 3, &posmtx_row, sizeof posmtx_row);
-    std::memcpy(out_vertex + kVertexTexMtxIdxOffset / 4u, &texmtxidx_packed,
-                sizeof texmtxidx_packed);
-    std::memcpy(out_vertex + kVertexTexMtxIdxHiOffset / 4u,
-                &texmtxidx_packed_hi, sizeof texmtxidx_packed_hi);
+    std::memcpy(out_vertex + kVertexPosMtxOffset / 4u, &posmtx_row, sizeof posmtx_row);
+    // The tex-matrix indices (zero without a TEXMTXIDX, which makes a draw
+    // full) are in the full layout only.
+    if (full_layout) {
+      std::memcpy(out_vertex + kVertexTexMtxIdxOffset / 4u, &texmtxidx_packed,
+                  sizeof texmtxidx_packed);
+      std::memcpy(out_vertex + kVertexTexMtxIdxHiOffset / 4u,
+                  &texmtxidx_packed_hi, sizeof texmtxidx_packed_hi);
+    }
   }
 
   // Uniforms. Most draws are made with the transform state of the draw
@@ -1954,7 +1976,7 @@ void GxCoreState::build_draw_plan_into(const ar::ConsumedDraw& draw,
     if (plan.vertex_count > 0u) {
       const float* last =
           plan.vertices.data() +
-          static_cast<std::size_t>(plan.vertex_count - 1u) * kVertexFloats;
+          static_cast<std::size_t>(plan.vertex_count - 1u) * plan.vertex_floats;
       if (walk.has_normal)
         for (std::uint32_t k = 0; k < 3u; ++k)
           cached->normal[k] = last[kVertexNormalOffset / 4u + k];

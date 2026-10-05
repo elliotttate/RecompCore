@@ -1305,6 +1305,15 @@ static bool screen_space_sprite(const gxc::DrawPlan& plan) noexcept {
          !plan.pipeline.depth_test && !plan.pipeline.depth_update;
 }
 
+// A decoded vertex's uv slot `slot`, component `st`: a compact vertex holds uv0-1
+// (a format with uv2-4 is full), and the others read 0, as the full layout
+// holds an absent uv.
+static float vertex_uv(const gxc::DrawPlan& plan, const float* vertex, unsigned slot, unsigned st) noexcept {
+  if (slot >= gxc::kMaxTexGens || (slot >= 2u && plan.vertex_floats != gxc::kFullVertexFloats))
+    return 0.f;
+  return vertex[gxc::vertex_uv_offset(slot) / sizeof(float) + st];
+}
+
 static uint64_t draw_key_of(const gxc::DrawPlan& plan) noexcept {
   if (plan.match_payload == nullptr || plan.match_payload_size == 0)
     return 0;
@@ -1342,14 +1351,14 @@ static uint64_t draw_key_of(const gxc::DrawPlan& plan) noexcept {
       // Position and scale may animate, so those are compared as bounds by
       // match_draw(). A particle tag left in GX state is not a UI identity.
       h = mix64(h ^ 0x53435245454Eull);
-      const size_t decoded = plan.vertices.size() / gxc::kVertexFloats;
+      const size_t decoded = plan.vertices.size() / plan.vertex_floats;
       if (decoded == 0 || decoded > kMaxBlendedVertices)
         return 0;
       for (size_t v = 0; v < decoded; ++v) {
-        const float* vertex = plan.vertices.data() + v * gxc::kVertexFloats;
+        const float* vertex = plan.vertices.data() + v * plan.vertex_floats;
         for (unsigned uv = 0; uv < plan.pipeline.shader.num_tex_gens && uv < gxc::kMaxTexGens; ++uv)
           for (unsigned st = 0; st < 2; ++st)
-            h = mix64(h ^ std::bit_cast<uint32_t>(vertex[gxc::kVertexUvOffset / sizeof(float) + uv * 2 + st]));
+            h = mix64(h ^ std::bit_cast<uint32_t>(vertex_uv(plan, vertex, uv, st)));
         for (unsigned rgb = 0; rgb < 3; ++rgb)
           h = mix64(h ^ std::bit_cast<uint32_t>(vertex[gxc::kVertexColor0Offset / sizeof(float) + rgb]));
       }
@@ -1394,7 +1403,7 @@ static uint64_t draw_key_of(const gxc::DrawPlan& plan) noexcept {
 uint64_t draw_key(const gxc::DrawPlan& plan) noexcept { return draw_key_of(plan); }
 
 bool may_blend_vertices(const gxc::DrawPlan& plan) noexcept {
-  const size_t decoded = plan.vertices.size() / gxc::kVertexFloats;
+  const size_t decoded = plan.vertices.size() / plan.vertex_floats;
   return decoded > 0 && decoded <= kMaxBlendedVertices && !plan.pipeline.shader.has_pos_mtx_idx &&
          (!plan.match_direct_position || plan.draw_tag != 0 || plan.draw_scope_part != 0 ||
           screen_space_sprite(plan));
@@ -1427,7 +1436,7 @@ void capture_draw(const gxc::DrawPlan& plan, DrawInput& out, bool positionsWritt
   // shape is not the same points from one frame to the next (the boat's
   // shadow is cast on the sea's triangles under it, a different list as it
   // moves), and blending one list toward the other drew the shadow torn.
-  const size_t decoded = plan.vertices.size() / gxc::kVertexFloats;
+  const size_t decoded = plan.vertices.size() / plan.vertex_floats;
   // A cloth's strip (a scope over draws that index their positions): the
   // game moves its vertices each frame, so they are blended one by one, as a
   // particle's are.
@@ -1438,7 +1447,7 @@ void capture_draw(const gxc::DrawPlan& plan, DrawInput& out, bool positionsWritt
       out.positions.resize(decoded * 3u);
       for (size_t i = 0; i < decoded; ++i)
         std::memcpy(out.positions.data() + i * 3u,
-                    plan.vertices.data() + i * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float),
+                    plan.vertices.data() + i * plan.vertex_floats + gxc::kVertexPosOffset / sizeof(float),
                     sizeof(float) * 3);
       out.age = out.screenSpace || plan.draw_scope_part != 0 ? 0u : plan.draw_tag_age;
       out.tagged = !out.screenSpace;
@@ -1474,7 +1483,7 @@ void capture_draw(const gxc::DrawPlan& plan, DrawInput& out, bool positionsWritt
     out.positions.resize(decoded * 3u);
     for (size_t i = 0; i < decoded; ++i)
       std::memcpy(out.positions.data() + i * 3u,
-                  plan.vertices.data() + i * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float),
+                  plan.vertices.data() + i * plan.vertex_floats + gxc::kVertexPosOffset / sizeof(float),
                   sizeof(float) * 3);
     out.texcoordMask = plan.match_direct_texcoord_mask & ((1u << gxc::kMaxTexGens) - 1u);
     const size_t uvStride = 2u * std::popcount(out.texcoordMask);
@@ -1483,9 +1492,9 @@ void capture_draw(const gxc::DrawPlan& plan, DrawInput& out, bool positionsWritt
       size_t at = v * uvStride;
       for (unsigned uv = 0; uv < gxc::kMaxTexGens; ++uv)
         if ((out.texcoordMask >> uv) & 1u) {
-          std::memcpy(out.texcoords.data() + at,
-                      plan.vertices.data() + v * gxc::kVertexFloats + gxc::kVertexUvOffset / sizeof(float) + uv * 2u,
-                      sizeof(float) * 2);
+          const float* vertex = plan.vertices.data() + v * plan.vertex_floats;
+          out.texcoords[at] = vertex_uv(plan, vertex, uv, 0);
+          out.texcoords[at + 1] = vertex_uv(plan, vertex, uv, 1);
           at += 2;
         }
     }
@@ -1495,11 +1504,11 @@ void capture_draw(const gxc::DrawPlan& plan, DrawInput& out, bool positionsWritt
   // position matrix takes them from), for blend_draw() to see whether the
   // game moved them itself (see vertex_motion()).
   const uint32_t count = plan.vertex_count;
-  if (count >= 3 && plan.vertices.size() >= static_cast<size_t>(count) * gxc::kVertexFloats) {
+  if (count >= 3 && plan.vertices.size() >= static_cast<size_t>(count) * plan.vertex_floats) {
     const uint32_t picks[3] = {0, count / 2, count - 1};
     for (int i = 0; i < 3; ++i)
       std::memcpy(&out.samples[i * 3],
-                  plan.vertices.data() + static_cast<size_t>(picks[i]) * gxc::kVertexFloats +
+                  plan.vertices.data() + static_cast<size_t>(picks[i]) * plan.vertex_floats +
                       gxc::kVertexPosOffset / sizeof(float),
                   sizeof(float) * 3);
     out.haveSamples = true;

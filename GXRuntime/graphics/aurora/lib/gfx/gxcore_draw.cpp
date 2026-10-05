@@ -429,10 +429,14 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   };
   const auto pipelineLayout = g_device.CreatePipelineLayout(&layoutDescriptor);
 
-  // Fixed decoded-vertex layout (gxruntime/gxcore/shader.hpp). The normal
-  // (location 8) is only declared by the lit shader, so add it to the pipeline
-  // only when the key is lit — WGSL requires the vertex layout to satisfy every
-  // shader input.
+  // The decoded-vertex layouts (gxruntime/gxcore/shader.hpp): the key decides
+  // compact or full. A compact draw's pipeline reads the full layout's other
+  // inputs (color1, uv2-4, the tex-matrix indices, binormal, tangent) from a
+  // second stream, one element of their defaults (vertex_extra_defaults()),
+  // stepped per instance. Conditional inputs (normal, location 8, and the
+  // rest below) are only added when the shader declares them: WGSL requires
+  // the vertex layout to satisfy every shader input.
+  const bool fullLayout = gxc::vertex_layout_full(key.shader);
   std::vector<wgpu::VertexAttribute> attributes{
       wgpu::VertexAttribute{
           .format = wgpu::VertexFormat::Float32x3,
@@ -450,31 +454,28 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
           .shaderLocation = 2,
       },
       wgpu::VertexAttribute{
-          .format = wgpu::VertexFormat::Float32x4,
-          .offset = gxc::kVertexColor1Offset,
-          .shaderLocation = 3,
-      },
-      wgpu::VertexAttribute{
           .format = wgpu::VertexFormat::Float32x2,
-          .offset = gxc::kVertexUvOffset,
+          .offset = gxc::vertex_uv_offset(0),
           .shaderLocation = 4,
       },
       wgpu::VertexAttribute{
           .format = wgpu::VertexFormat::Float32x2,
-          .offset = gxc::kVertexUvOffset + 8,
+          .offset = gxc::vertex_uv_offset(1),
           .shaderLocation = 5,
       },
-      wgpu::VertexAttribute{
-          .format = wgpu::VertexFormat::Float32x2,
-          .offset = gxc::kVertexUvOffset + 16,
-          .shaderLocation = 6,
-      },
-      wgpu::VertexAttribute{
-          .format = wgpu::VertexFormat::Float32x2,
-          .offset = gxc::kVertexUvOffset + 24,
-          .shaderLocation = 7,
-      },
   };
+  std::vector<wgpu::VertexAttribute> extraAttributes;
+  // An input of the full layout's own part: from the vertices, or the defaults.
+  const auto addExtra = [&](wgpu::VertexFormat format, uint32_t offset, uint32_t location) {
+    if (fullLayout)
+      attributes.push_back(wgpu::VertexAttribute{.format = format, .offset = offset, .shaderLocation = location});
+    else
+      extraAttributes.push_back(wgpu::VertexAttribute{
+          .format = format, .offset = offset - gxc::kCompactVertexStrideBytes, .shaderLocation = location});
+  };
+  addExtra(wgpu::VertexFormat::Float32x4, gxc::kVertexColor1Offset, 3);
+  addExtra(wgpu::VertexFormat::Float32x2, gxc::vertex_uv_offset(2), 6);
+  addExtra(wgpu::VertexFormat::Float32x2, gxc::vertex_uv_offset(3), 7);
   // Item-5 texgen inputs must mirror the generator's VertexIn: emboss needs the
   // NBT normal/binormal/tangent + light dir; a Color1/emboss key that is unlit
   // still declares the normal (location 8). Detect emboss demand from the key.
@@ -502,47 +503,30 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
         .shaderLocation = 8,
     });
   }
-  if (uber || key.shader.has_tex_mtx_idx != 0) {
-    attributes.push_back(wgpu::VertexAttribute{
-        .format = wgpu::VertexFormat::Uint32,
-        .offset = gxc::kVertexTexMtxIdxOffset,
-        .shaderLocation = 9,
-    });
-  }
-  if (uber || (has_emboss && key.shader.has_vertex_binormal != 0)) {
-    attributes.push_back(wgpu::VertexAttribute{
-        .format = wgpu::VertexFormat::Float32x3,
-        .offset = gxc::kVertexBinormalOffset,
-        .shaderLocation = 10,
-    });
-  }
-  if (uber || (has_emboss && key.shader.has_vertex_tangent != 0)) {
-    attributes.push_back(wgpu::VertexAttribute{
-        .format = wgpu::VertexFormat::Float32x3,
-        .offset = gxc::kVertexTangentOffset,
-        .shaderLocation = 11,
-    });
-  }
-  if (uber || (key.shader.uv_mask & (1u << 4u)) != 0u) {
-    attributes.push_back(wgpu::VertexAttribute{
-        .format = wgpu::VertexFormat::Float32x2,
-        .offset = gxc::kVertexUvOffset + 32u,
-        .shaderLocation = 12,
-    });
-  }
+  if (uber || key.shader.has_tex_mtx_idx != 0)
+    addExtra(wgpu::VertexFormat::Uint32, gxc::kVertexTexMtxIdxOffset, 9);
+  if (uber || (has_emboss && key.shader.has_vertex_binormal != 0))
+    addExtra(wgpu::VertexFormat::Float32x3, gxc::kVertexBinormalOffset, 10);
+  if (uber || (has_emboss && key.shader.has_vertex_tangent != 0))
+    addExtra(wgpu::VertexFormat::Float32x3, gxc::kVertexTangentOffset, 11);
+  if (uber || (key.shader.uv_mask & (1u << 4u)) != 0u)
+    addExtra(wgpu::VertexFormat::Float32x2, gxc::vertex_uv_offset(4), 12);
   if (uber || (key.shader.has_tex_mtx_idx != 0 &&
-                (key.shader.tex_mtx_idx_mask & 0xF0u) != 0u)) {
-    attributes.push_back(wgpu::VertexAttribute{
-        .format = wgpu::VertexFormat::Uint32,
-        .offset = gxc::kVertexTexMtxIdxHiOffset,
-        .shaderLocation = 13,
-    });
-  }
-  const wgpu::VertexBufferLayout vertexLayout{
-      .arrayStride = gxc::kVertexStrideBytes,
-      .stepMode = wgpu::VertexStepMode::Vertex,
-      .attributeCount = attributes.size(),
-      .attributes = attributes.data(),
+                (key.shader.tex_mtx_idx_mask & 0xF0u) != 0u))
+    addExtra(wgpu::VertexFormat::Uint32, gxc::kVertexTexMtxIdxHiOffset, 13);
+  const std::array<wgpu::VertexBufferLayout, 2> vertexLayouts{
+      wgpu::VertexBufferLayout{
+          .arrayStride = fullLayout ? gxc::kFullVertexStrideBytes : gxc::kCompactVertexStrideBytes,
+          .stepMode = wgpu::VertexStepMode::Vertex,
+          .attributeCount = attributes.size(),
+          .attributes = attributes.data(),
+      },
+      wgpu::VertexBufferLayout{
+          .arrayStride = gxc::kVertexExtraBytes,
+          .stepMode = wgpu::VertexStepMode::Instance,
+          .attributeCount = extraAttributes.size(),
+          .attributes = extraAttributes.data(),
+      },
   };
 
   // The ubershader draws without early-depth emulation (a frame or two).
@@ -649,8 +633,8 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
           wgpu::VertexState{
               .module = module,
               .entryPoint = "vs_main",
-              .bufferCount = 1,
-              .buffers = &vertexLayout,
+              .bufferCount = extraAttributes.empty() ? 1u : 2u,
+              .buffers = vertexLayouts.data(),
           },
       .primitive =
           wgpu::PrimitiveState{
@@ -692,6 +676,7 @@ namespace {
 struct PassState {
   WGPUBuffer vertexBuffer = nullptr; // bound whole, or a particle's range
   uint64_t vertexOffset = 0;
+  bool extraBound = false; // the default stream at slot 1
   bool indexBound = false;
   PipelineRef pipeline = 0;
   WGPUBindGroup group1 = nullptr;
@@ -704,6 +689,29 @@ PassState g_pass;
 } // namespace
 
 void reset_pass_state() { g_pass = PassState{}; }
+
+// The compact layout's second stream: one element of the full layout's own
+// inputs at their defaults (color1 white, uv2-4, the tex-matrix indices,
+// binormal and tangent zero), which a full draw's decoder writes where its
+// format lacks them (gxcore.cpp). Made at first use, kept for the device's life.
+const wgpu::Buffer& vertex_extra_defaults() {
+  static wgpu::Buffer buffer;
+  if (!buffer) {
+    const wgpu::BufferDescriptor descriptor{
+        .label = "GXCore Vertex Defaults",
+        .usage = wgpu::BufferUsage::Vertex,
+        .size = gxc::kVertexExtraBytes,
+        .mappedAtCreation = true,
+    };
+    buffer = g_device.CreateBuffer(&descriptor);
+    auto* data = static_cast<float*>(buffer.GetMappedRange(0, gxc::kVertexExtraBytes));
+    std::memset(data, 0, gxc::kVertexExtraBytes);
+    for (int c = 0; c < 4; ++c)
+      data[(gxc::kVertexColor1Offset - gxc::kCompactVertexStrideBytes) / 4u + c] = 1.f;
+    buffer.Unmap();
+  }
+  return buffer;
+}
 
 // What a draw, or one of a batch's (submit_draw_plan) draws, is encoded with:
 // its constants and a particle's in-between vertices (empty: the frame's
@@ -768,6 +776,11 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
     }
   };
   const uint32_t firstIndex = data.idxRange.offset / sizeof(uint16_t);
+  const uint32_t vertexStride = data.fullVertices ? gxc::kFullVertexStrideBytes : gxc::kCompactVertexStrideBytes;
+  if (!data.fullVertices && !g_pass.extraBound) {
+    pass.SetVertexBuffer(1, vertex_extra_defaults());
+    g_pass.extraBound = true;
+  }
   // One draw, or a batch as one; a batch whose draws' in-between blocks (or a
   // particle's vertices, laid out apart from the batch's) differ, one by one.
   static std::vector<DrawPart> parts;
@@ -784,7 +797,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
               pixel.offset == whole.pixel.offset && pixel.size == whole.pixel.size &&
               (whole.verts.size == 0 ? verts.size == 0
                                      : verts.size != 0 && verts.offset == whole.verts.offset +
-                                                                              first * gxc::kVertexStrideBytes);
+                                                                              first * vertexStride);
     }
     if (!asOne) {
       uint32_t index = firstIndex;
@@ -815,7 +828,7 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   // bound where the part's first index (counted from the batch's first
   // vertex) finds them.
   const auto setVertices = [&](const DrawPart& part) -> int32_t {
-    const uint64_t back = uint64_t{part.firstVertex} * gxc::kVertexStrideBytes;
+    const uint64_t back = uint64_t{part.firstVertex} * vertexStride;
     if (part.verts.size != 0 && part.verts.offset >= back) {
       const uint64_t offset = part.verts.offset - back;
       if (g_pass.vertexBuffer != g_interpVertexBuffer.Get() || g_pass.vertexOffset != offset) {
@@ -825,13 +838,13 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
       }
       return 0;
     }
-    if (data.vertRange.offset % gxc::kVertexStrideBytes == 0) {
+    if (data.vertRange.offset % vertexStride == 0) {
       if (g_pass.vertexBuffer != g_vertexBuffer.Get() || g_pass.vertexOffset != 0) {
         pass.SetVertexBuffer(0, g_vertexBuffer);
         g_pass.vertexBuffer = g_vertexBuffer.Get();
         g_pass.vertexOffset = 0;
       }
-      return static_cast<int32_t>(data.vertRange.offset / gxc::kVertexStrideBytes);
+      return static_cast<int32_t>(data.vertRange.offset / vertexStride);
     }
     pass.SetVertexBuffer(0, g_vertexBuffer, data.vertRange.offset, data.vertRange.size);
     g_pass.vertexBuffer = g_vertexBuffer.Get();
@@ -1152,6 +1165,7 @@ namespace {
 struct InterpJob {
   frame_interp::DrawInput input; // its key, samples and a particle's positions
   std::vector<float> vertices;   // a particle's decoded vertices, for its blended copy
+  uint32_t vertexFloats = gxc::kCompactVertexFloats; // and their layout's
   uint64_t frameId;
   size_t slot;
   bool repeatsLastDraw; // the constants are the draw before's (repeats_cached)
@@ -1169,20 +1183,24 @@ struct InterpJob {
 
 // A draw's in-between vertices: replace its blended positions and direct UVs
 // while preserving all other attributes in the current vertex stream.
-Range push_blended_vertices(size_t slot, const std::vector<float>& vertices, const float* positions,
-                            const float* texcoords, uint8_t texcoordMask, std::vector<float>& scratch) {
+Range push_blended_vertices(size_t slot, const std::vector<float>& vertices, uint32_t vertexFloats,
+                            const float* positions, const float* texcoords, uint8_t texcoordMask,
+                            std::vector<float>& scratch) {
   scratch.assign(vertices.begin(), vertices.end());
-  const size_t count = scratch.size() / gxc::kVertexFloats;
+  const size_t count = scratch.size() / vertexFloats;
+  // A compact vertex holds uv0-1 (a format with uv2-4 is full): the others'
+  // blended values are skipped, as the pipeline reads their defaults.
+  const unsigned uvSlots = vertexFloats == gxc::kFullVertexFloats ? gxc::kMaxTexGens : 2u;
   size_t uvAt = 0;
   for (size_t i = 0; i < count; ++i) {
-    float* vertex = scratch.data() + i * gxc::kVertexFloats;
+    float* vertex = scratch.data() + i * vertexFloats;
     if (positions != nullptr)
       std::memcpy(vertex + gxc::kVertexPosOffset / sizeof(float), positions + i * 3u, sizeof(float) * 3u);
     if (texcoords != nullptr)
       for (unsigned uv = 0; uv < gxc::kMaxTexGens; ++uv)
         if ((texcoordMask >> uv) & 1u) {
-          std::memcpy(vertex + gxc::kVertexUvOffset / sizeof(float) + uv * 2u,
-                      texcoords + uvAt, sizeof(float) * 2u);
+          if (uv < uvSlots)
+            std::memcpy(vertex + gxc::vertex_uv_offset(uv) / sizeof(float), texcoords + uvAt, sizeof(float) * 2u);
           uvAt += 2;
         }
   }
@@ -1270,7 +1288,7 @@ void interp_helper_main(InterpHelper* h) {
       const float* positions = frame_interp::blended_positions(step);
       const float* texcoords = frame_interp::blended_texcoords(step);
       if (positions != nullptr || texcoords != nullptr)
-        ranges.verts[step] = push_blended_vertices(job.slot, job.vertices, positions, texcoords,
+        ranges.verts[step] = push_blended_vertices(job.slot, job.vertices, job.vertexFloats, positions, texcoords,
                                                  frame_interp::blended_texcoord_mask(), h->vertices);
       if (const gxc::PixelShaderConstants* pixel = frame_interp::blended_pixel(step))
         ranges.pixel[step] = push_interp_uniform_dedup(h->pixelCache[step], job.frameId, job.slot,
@@ -1377,6 +1395,7 @@ uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw, bool 
     job.vertices.clear();
   else
     job.vertices.assign(plan.vertices.begin(), plan.vertices.end());
+  job.vertexFloats = plan.vertex_floats;
   job.frameId = frameId;
   job.slot = recording_frame_slot();
   job.repeatsLastDraw = repeatsLastDraw;
@@ -1930,8 +1949,8 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   const float* tracedTexcoords = matchHere ? frame_interp::blended_texcoords() : nullptr;
   const Range interpVertRange =
       tracedPositions != nullptr || tracedTexcoords != nullptr
-          ? push_blended_vertices(recording_frame_slot(), plan.vertices, tracedPositions, tracedTexcoords,
-                                  frame_interp::blended_texcoord_mask(), tracedVertices)
+          ? push_blended_vertices(recording_frame_slot(), plan.vertices, plan.vertex_floats, tracedPositions,
+                                  tracedTexcoords, frame_interp::blended_texcoord_mask(), tracedVertices)
           : Range{};
   if (frame_interp::tracing()) {
     const auto& m = plan.constants.posnormalmatrix;
@@ -1954,8 +1973,8 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
                  interpConstants ? interpConstants->transformmatrices[2][3] - plan.constants.transformmatrices[2][3] : 0.f,
                  plan.match_direct_position ? 1 : 0, plan.draw_tag, plan.draw_tag_age, plan.draw_scope, plan.draw_scope_part,
                  tracedPositions != nullptr ? 1 : 0, frame_interp::blended_texcoord_mask(),
-                 plan.vertices.empty() ? 0.f : plan.vertices[gxc::kVertexUvOffset / sizeof(float)],
-                 plan.vertices.empty() ? 0.f : plan.vertices[gxc::kVertexUvOffset / sizeof(float) + 1],
+                 plan.vertices.empty() ? 0.f : plan.vertices[gxc::kVertexUv0Offset / sizeof(float)],
+                 plan.vertices.empty() ? 0.f : plan.vertices[gxc::kVertexUv0Offset / sizeof(float) + 1],
                  tracedTexcoords != nullptr ? tracedTexcoords[0] : 0.f,
                  tracedTexcoords != nullptr ? tracedTexcoords[1] : 0.f,
                  tracedPositions != nullptr ? tracedPositions[0] : 0.f,
@@ -1964,9 +1983,11 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   }
   // (Room too for a pixel block of the ubershader's, should the draw need one.)
   const size_t pixelRoom = pixelUniformBytes + sizeof(gxc::UberPixelConstants);
-  if (!staging_has_capacity(vertBytes + gxc::kVertexStrideBytes, indexBytes, sizeof(plan.constants), pixelRoom)) {
+  if (!staging_has_capacity(vertBytes + gxc::kFullVertexStrideBytes, indexBytes, sizeof(plan.constants),
+                            pixelRoom)) {
     if (!segment_frame() ||
-        !staging_has_capacity(vertBytes + gxc::kVertexStrideBytes, indexBytes, sizeof(plan.constants), pixelRoom)) {
+        !staging_has_capacity(vertBytes + gxc::kFullVertexStrideBytes, indexBytes, sizeof(plan.constants),
+                              pixelRoom)) {
       Log.error("GXCore draw exceeds an empty Aurora staging segment");
       return false;
     }
@@ -2072,6 +2093,9 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       PipelineConfig uberConfig = colorConfig;
       uberConfig.key.shader = gxc::ShaderKey{};
       uberConfig.key.shader.use_dst_alpha = plan.pipeline.shader.use_dst_alpha;
+      // The ubershader's own key carries the draw's vertex layout (its WGSL does
+      // not depend on it): has_color1 marks the full one.
+      uberConfig.key.shader.has_color1 = gxc::vertex_layout_full(plan.pipeline.shader) ? 1u : 0u;
       uberConfig.depthOnly = 2u;
       uberPipeline = pipeline_ref(uberConfig);
       static gxc::UberPixelConstants block; // one recording thread at a time
@@ -2095,7 +2119,9 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     const char* env = std::getenv("DOL_AURORA_GXCORE_BATCH");
     return env == nullptr || env[0] != '0';
   }();
-  const size_t vertexOffset = next_vertex_offset(gxc::kVertexStrideBytes);
+  const bool fullVertices = plan.vertex_floats == gxc::kFullVertexFloats;
+  const uint32_t vertexStride = plan.vertex_floats * sizeof(float);
+  const size_t vertexOffset = next_vertex_offset(vertexStride);
   DrawData* batch = nullptr;
   uint32_t firstVertex = 0;
   // Independently blended vertices cannot share a batch's rebased index
@@ -2110,10 +2136,10 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
         last->interpUniformRange.size == 0 && last->interpVertRange.size == 0 &&
         (interpolating ? last->interpJob != UINT32_MAX && last->interpJob + last->batchSize == next_interp_job()
                        : last->interpJob == UINT32_MAX) &&
-        last->vertRange.offset % gxc::kVertexStrideBytes == 0 &&
+        last->fullVertices == fullVertices && last->vertRange.offset % vertexStride == 0 &&
         last->vertRange.offset + last->vertRange.size == vertexOffset &&
         last->idxRange.offset + last->idxRange.size == next_index_offset()) {
-      const size_t first = (vertexOffset - last->vertRange.offset) / gxc::kVertexStrideBytes;
+      const size_t first = (vertexOffset - last->vertRange.offset) / vertexStride;
       if (first + plan.vertex_count <= 65536u) {
         batch = last;
         firstVertex = static_cast<uint32_t>(first);
@@ -2124,7 +2150,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // On a whole vertex: render() draws it at a base vertex of the whole buffer.
   const auto vertRange = push_verts_strided(
       reinterpret_cast<const uint8_t*>(plan.vertices.data()),
-      vertBytes, gxc::kVertexStrideBytes);
+      vertBytes, vertexStride);
   Range idxRange;
   if (batch != nullptr) {
     static std::vector<uint16_t> rebased;
@@ -2170,6 +2196,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
       .textureBindGroup = textureBindGroup,
       .tev = tev,
       .ownVertices = ownVertices,
+      .fullVertices = fullVertices,
       .uberPipeline = uberPipeline,
       .uberPixelRange = uberPixelRange,
       .uberTextureBindGroup = uberTextureBindGroup,

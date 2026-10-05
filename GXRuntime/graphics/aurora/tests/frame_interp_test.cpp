@@ -125,14 +125,14 @@ int main() {
     hud.vertex_count = 4;
     hud.tex_address = 0x00EA78A0;
     hud.pipeline.shader.num_tex_gens = 1;
-    hud.vertices.resize(4 * gxc::kVertexFloats);
+    hud.vertices.resize(4 * gxc::kCompactVertexFloats);
     const auto quad = [&](float width, float height) {
       for (unsigned v = 0; v < 4; ++v) {
-        auto* vertex = hud.vertices.data() + v * gxc::kVertexFloats;
+        auto* vertex = hud.vertices.data() + v * gxc::kCompactVertexFloats;
         vertex[gxc::kVertexPosOffset / sizeof(float)] = (v == 1 || v == 2) ? width : 0.f;
         vertex[gxc::kVertexPosOffset / sizeof(float) + 1] = v >= 2 ? height : 0.f;
-        vertex[gxc::kVertexUvOffset / sizeof(float)] = (v == 1 || v == 2) ? 1.f : 0.f;
-        vertex[gxc::kVertexUvOffset / sizeof(float) + 1] = v >= 2 ? 1.f : 0.f;
+        vertex[gxc::kVertexUv0Offset / sizeof(float)] = (v == 1 || v == 2) ? 1.f : 0.f;
+        vertex[gxc::kVertexUv0Offset / sizeof(float) + 1] = v >= 2 ? 1.f : 0.f;
         for (unsigned c = 0; c < 4; ++c)
           vertex[gxc::kVertexColor0Offset / sizeof(float) + c] = 1.f;
       }
@@ -155,7 +155,7 @@ int main() {
     CHECK(fi::draw_key(hud) == key);
     hud.vertices[gxc::kVertexColor0Offset / sizeof(float) + 3] = .5f;
     CHECK(fi::draw_key(hud) == key); // fade alpha may animate
-    hud.vertices[gxc::kVertexUvOffset / sizeof(float)] = .25f;
+    hud.vertices[gxc::kVertexUv0Offset / sizeof(float)] = .25f;
     CHECK(fi::draw_key(hud) != key); // another atlas region is another glyph
     quad(20.f, 30.f);
     hud.vertices[gxc::kVertexColor0Offset / sizeof(float)] = 0.f;
@@ -707,12 +707,12 @@ int main() {
       plan.match_primitive = 0x98;
       plan.match_vertex_stride = 2;
       plan.vertex_count = 6;
-      plan.vertices.assign(6 * gxc::kVertexFloats, 0.f);
+      plan.vertices.assign(6 * gxc::kCompactVertexFloats, 0.f);
       for (int v = 0; v < 6; ++v)
-        world(frame, v, &plan.vertices[v * gxc::kVertexFloats]);
+        world(frame, v, &plan.vertices[v * gxc::kCompactVertexFloats]);
       const auto view = seen(c.yaw, c.x, c.z, 0.f, 0.f, 0.f);
       for (int v = 0; v < 6; ++v)
-        seen_at(view.posnormalmatrix, &plan.vertices[v * gxc::kVertexFloats], drawn[frame][v]);
+        seen_at(view.posnormalmatrix, &plan.vertices[v * gxc::kCompactVertexFloats], drawn[frame][v]);
       const auto* got = blend_plan(plan, view);
       if (frame == 2) {
         const float* vertices = fi::blended_positions();
@@ -758,14 +758,14 @@ int main() {
         plan.match_position_size = 2;
         plan.match_direct_texcoord_mask = (1u << 0) | (1u << 2);
         plan.vertex_count = 4;
-        plan.vertices.assign(4 * gxc::kVertexFloats, 0.f);
+        plan.vertices.assign(4 * gxc::kCompactVertexFloats, 0.f);
         for (int v = 0; v < 4; ++v) {
           const int index = strip * 2 + v;
-          float* p = plan.vertices.data() + v * gxc::kVertexFloats;
+          float* p = plan.vertices.data() + v * gxc::kCompactVertexFloats;
           p[0] = -200000.f + 800.f * (index / 2) + (movingCamera ? 20.f * frame : 0.f);
           p[1] = float((index * index + 3) * frame); // non-rigid deformation
           p[2] = -800.f * (index % 2);
-          float* uv = p + gxc::kVertexUvOffset / sizeof(float);
+          float* uv = p + gxc::kVertexUv0Offset / sizeof(float);
           uv[0] = p[0] * .0005f;
           uv[1] = p[2] * .0005f;
           uv[4] = .02f * frame; // another direct channel, also animated
@@ -827,12 +827,12 @@ int main() {
       plan.match_position_size = 2;
       plan.match_direct_texcoord_mask = (1u << 0) | (1u << 2);
       plan.vertex_count = 4;
-      plan.vertices.assign(4 * gxc::kVertexFloats, 0.f);
+      plan.vertices.assign(4 * gxc::kCompactVertexFloats, 0.f);
       for (int v = 0; v < 4; ++v) {
-        float* p = plan.vertices.data() + v * gxc::kVertexFloats;
+        float* p = plan.vertices.data() + v * gxc::kCompactVertexFloats;
         p[0] = v * 20.f;
         p[2] = -400.f;
-        float* uv = p + gxc::kVertexUvOffset / sizeof(float);
+        float* uv = p + gxc::kVertexUv0Offset / sizeof(float);
         uv[0] = wraps ? (frame == 0 ? .98f : .02f) : .1f + .04f * frame;
         uv[1] = .2f;
         uv[4] = .3f + .02f * frame;
@@ -923,10 +923,10 @@ int main() {
       plan.draw_tag = tag;
       plan.draw_tag_age = age;
       plan.tex_address = 0x1234;
-      plan.vertices.assign(4 * gxc::kVertexFloats, 0.f);
+      plan.vertices.assign(4 * gxc::kCompactVertexFloats, 0.f);
       const float corners[4][2] = {{-5, 5}, {5, 5}, {5, -5}, {-5, -5}};
       for (int i = 0; i < 4; ++i) {
-        float* v = plan.vertices.data() + i * gxc::kVertexFloats + gxc::kVertexPosOffset / sizeof(float);
+        float* v = plan.vertices.data() + i * gxc::kCompactVertexFloats + gxc::kVertexPosOffset / sizeof(float);
         v[0] = x + corners[i][0];
         v[1] = y + corners[i][1];
         v[2] = -400.f;
@@ -977,7 +977,7 @@ int main() {
       const auto at = seen(yaw, 0, 0, 100.f, 20.f, -600.f);
       auto spark = particle(300, 0, at.posnormalmatrix[0][3], at.posnormalmatrix[1][3]);
       for (int i = 0; i < 4; ++i)
-        spark.vertices[i * gxc::kVertexFloats + 2] = at.posnormalmatrix[2][3];
+        spark.vertices[i * gxc::kCompactVertexFloats + 2] = at.posnormalmatrix[2][3];
       return spark;
     };
     fi::end_game_frame();
@@ -1011,7 +1011,7 @@ int main() {
       plan.match_direct_position = true;
       plan.vertex_count = triangles * 3u;
       plan.tex_address = 0x5678;
-      plan.vertices.assign(plan.vertex_count * gxc::kVertexFloats, 0.f);
+      plan.vertices.assign(plan.vertex_count * gxc::kCompactVertexFloats, 0.f);
       return plan;
     };
     const char* outcomes[8] = {};
@@ -1100,9 +1100,9 @@ int main() {
       plan.vertex_count = 6;
       plan.draw_scope = 0x4321;
       plan.draw_scope_part = part;
-      plan.vertices.assign(6 * gxc::kVertexFloats, 0.f);
+      plan.vertices.assign(6 * gxc::kCompactVertexFloats, 0.f);
       for (int i = 0; i < 6; ++i) {
-        float* v = plan.vertices.data() + i * gxc::kVertexFloats;
+        float* v = plan.vertices.data() + i * gxc::kCompactVertexFloats;
         v[0] = (i % 3) * 10.f - 10.f;
         v[2] = boatZ + 60.f * (part - 1 + i / 3); // a row every 60 units behind the boat
       }
@@ -1136,9 +1136,9 @@ int main() {
       plan.vertex_count = 4;
       plan.draw_scope = 0x5151;
       plan.draw_scope_part = part;
-      plan.vertices.assign(4 * gxc::kVertexFloats, 0.f);
+      plan.vertices.assign(4 * gxc::kCompactVertexFloats, 0.f);
       for (int i = 0; i < 4; ++i) {
-        float* v = plan.vertices.data() + i * gxc::kVertexFloats;
+        float* v = plan.vertices.data() + i * gxc::kCompactVertexFloats;
         v[0] = (i & 1) * 20.f + sway * (i >> 1); // the free edge sways
         v[1] = (i >> 1) * 30.f;
       }
@@ -1225,10 +1225,10 @@ int main() {
       plan.match_direct_position = true;
       plan.vertex_count = 4;
       plan.draw_tag = 0x777;
-      plan.vertices.assign(4 * gxc::kVertexFloats, 0.f);
+      plan.vertices.assign(4 * gxc::kCompactVertexFloats, 0.f);
       for (int i = 0; i < 4; ++i) {
-        plan.vertices[i * gxc::kVertexFloats] = x + (i & 1) * 5.f;
-        plan.vertices[i * gxc::kVertexFloats + 2] = -400.f;
+        plan.vertices[i * gxc::kCompactVertexFloats] = x + (i & 1) * 5.f;
+        plan.vertices[i * gxc::kCompactVertexFloats + 2] = -400.f;
       }
       return plan;
     };

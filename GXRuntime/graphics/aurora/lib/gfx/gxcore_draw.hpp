@@ -50,6 +50,10 @@ struct DrawData {
   bool tev = false; // TEV path: PS uniform at group 2, texture at group 3
   // A tagged particle's, whose in-between vertices are its own (interpVertRange).
   bool ownVertices = false;
+  // Its vertices are in the full layout (gxruntime/gxcore/shader.hpp); the
+  // compact one otherwise, with the full layout's other inputs read from
+  // the default stream.
+  bool fullVertices = false;
   // The ubershader's pipeline for this draw's fixed-function state, its
   // pixel block (the pixel constants and the shader key) and a bind group with
   // all eight texmaps, when the draw's own pipeline was still compiling as it

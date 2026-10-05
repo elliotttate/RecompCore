@@ -885,7 +885,7 @@ std::string generate_wgsl(const ShaderKey& key) {
     }
   }
 
-  // Fixed vertex input layout (kVertexStrideBytes); unused inputs are ignored.
+  // Vertex inputs: the compact or full layout (shader.hpp); unused inputs are ignored.
   emit(out, "struct VertexIn {\n"
             "    @location(0) rawpos: vec3f,\n"
             "    @location(1) posmtx: u32,\n"

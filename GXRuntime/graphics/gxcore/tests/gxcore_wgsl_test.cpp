@@ -459,11 +459,12 @@ void test_state_to_plan_and_wgsl() {
     CHECK(rgb_plan.pipeline.alpha_update == 0u);
   }
 
-  // Decoded vertices: fixed 20-float layout.
+  // Decoded vertices: the compact layout (no color1, uv2-4, TEXMTXIDX or N/B/T).
   CHECK(plan.vertex_count == 4);
-  CHECK(plan.vertices.size() == 4u * gxc::kVertexFloats);
+  CHECK(plan.vertex_floats == gxc::kCompactVertexFloats);
+  CHECK(plan.vertices.size() == 4u * plan.vertex_floats);
   for (std::uint32_t v = 0; v < 4; ++v) {
-    const float* dec = plan.vertices.data() + v * gxc::kVertexFloats;
+    const float* dec = plan.vertices.data() + v * plan.vertex_floats;
     CHECK(dec[0] == quad[v][0]);
     CHECK(dec[1] == quad[v][1]);
     CHECK(dec[2] == quad[v][2]);
@@ -471,8 +472,8 @@ void test_state_to_plan_and_wgsl() {
     std::memcpy(&posmtx, dec + 3, sizeof posmtx);
     CHECK(posmtx == 0);
     CHECK(dec[4] == 1.f && dec[7] == 1.f); // default white color0
-    CHECK(dec[12] == quad[v][3]);
-    CHECK(dec[13] == quad[v][4]);
+    CHECK(dec[gxc::vertex_uv_offset(0) / 4u] == quad[v][3]);
+    CHECK(dec[gxc::vertex_uv_offset(0) / 4u + 1u] == quad[v][4]);
   }
   CHECK(plan.indices.size() == 6);
 
@@ -596,7 +597,8 @@ void test_vertex_texmtxidx_and_nbt() {
   CHECK(key.tex_mtx_idx_mask == 0x1);
   // Vertex 1 (pos.x == 1): TEXMTXIDX byte round-trips as a u32; binormal.y == 2,
   // tangent.z == 3.
-  const float* vtx = plan.vertices.data() + gxc::kVertexFloats; // vertex 1
+  CHECK(plan.vertex_floats == gxc::kFullVertexFloats); // TEXMTXIDX and N/B/T: the full layout
+  const float* vtx = plan.vertices.data() + plan.vertex_floats; // vertex 1
   std::uint32_t ti = 0;
   std::memcpy(&ti, vtx + gxc::kVertexTexMtxIdxOffset / 4u, sizeof ti);
   CHECK(ti == 33u);
@@ -771,8 +773,9 @@ void test_fifth_texgen_plan_decode() {
   CHECK(plan.constants.texmatrices[13][1] == 3.f);
   CHECK(plan.constants.texmatrices[14][2] == 4.f);
   const float* vertex = plan.vertices.data();
-  CHECK(vertex[(gxc::kVertexUvOffset + 32u) / 4u] == 0.25f);
-  CHECK(vertex[(gxc::kVertexUvOffset + 36u) / 4u] == 0.5f);
+  CHECK(plan.vertex_floats == gxc::kFullVertexFloats); // uv4: the full layout
+  CHECK(vertex[gxc::vertex_uv_offset(4) / 4u] == 0.25f);
+  CHECK(vertex[gxc::vertex_uv_offset(4) / 4u + 1u] == 0.5f);
   std::uint32_t texidx_hi = 0u;
   std::memcpy(&texidx_hi,
               vertex + gxc::kVertexTexMtxIdxHiOffset / 4u,

@@ -361,32 +361,53 @@ struct PixelShaderConstants {
 static_assert(sizeof(PixelShaderConstants) ==
               (4 + 4 + 1 + 1 + 1 + 1 + 3 + 1 + 8 + 6) * 16);
 
-// --- Fixed decoded-vertex layout (slice) ------------------------------------
+// --- Decoded-vertex layouts --------------------------------------------------
 //
-// The CPU vertex decoder (Dolphin VertexLoader semantics) normalizes every
-// draw to this one interleaved layout so the pipeline vertex state is
-// constant: pos vec3f | posmtx u32 (matrix ROW index) | color0 vec4f |
-// color1 vec4f | uv0..4 vec2f | normal vec3f | texmtxidx low/high u32 |
-// binormal vec3f | tangent vec3f. Input locations preserve the established
-// uv0..3/NBT ABI; uv4 and the high matrix-index word use locations 12/13.
-// normal (S15, @location 8), then the item-5 texgen block — per-vertex tex-matrix
-// indices packed one byte per texgen (@location 9), and the NBT binormal/tangent
-// emboss needs in view space (@location 10/11).
-inline constexpr std::uint32_t kVertexFloats =
-    3 + 1 + 4 + 4 + 2 * kMaxTexGens + 3 + 2 + 3 + 3;
-inline constexpr std::uint32_t kVertexStrideBytes = kVertexFloats * 4;
+// The CPU vertex decoder (Dolphin VertexLoader semantics) writes each draw in
+// one of two interleaved layouts, which the pipeline key decides
+// (vertex_layout_full), so a pipeline's vertex state follows from its key:
+// - compact (most draws), 60 bytes: pos vec3f | posmtx u32 (matrix ROW index)
+//   | color0 vec4f | uv0 vec2f | uv1 vec2f | normal vec3f;
+// - full, 132 bytes: the compact layout, then color1 vec4f | uv2..4 vec2f |
+//   texmtxidx low/high u32 | binormal vec3f | tangent vec3f. A draw whose
+//   format carries color1, tex2-4, a TEXMTXIDX or N/B/T is full.
+// Both put the attributes they share at the same offsets. A compact draw's
+// pipeline reads the full layout's other inputs from a one-element stream of
+// their defaults (color1 white, the rest zero), as the decoder writes them for
+// a full draw whose format lacks them. Input locations: pos 0, posmtx 1,
+// color0 2, color1 3, uv0..3 4-7, normal 8 (S15), the per-vertex tex-matrix
+// indices packed one byte per texgen 9 (item 5), the NBT binormal/tangent
+// emboss needs 10/11, uv4 12 and the high matrix-index word 13.
 inline constexpr std::uint32_t kVertexPosOffset = 0;
 inline constexpr std::uint32_t kVertexPosMtxOffset = 12;
 inline constexpr std::uint32_t kVertexColor0Offset = 16;
-inline constexpr std::uint32_t kVertexColor1Offset = 32;
-inline constexpr std::uint32_t kVertexUvOffset = 48; // + 8*i
-inline constexpr std::uint32_t kVertexNormalOffset = 48 + 8 * kMaxTexGens;
-inline constexpr std::uint32_t kVertexTexMtxIdxOffset = kVertexNormalOffset + 12;
-inline constexpr std::uint32_t kVertexTexMtxIdxHiOffset =
-    kVertexTexMtxIdxOffset + 4;
-inline constexpr std::uint32_t kVertexBinormalOffset =
-    kVertexTexMtxIdxHiOffset + 4;
+inline constexpr std::uint32_t kVertexUv0Offset = 32; // uv1 at +8
+inline constexpr std::uint32_t kVertexNormalOffset = 48;
+inline constexpr std::uint32_t kCompactVertexFloats = 15;
+inline constexpr std::uint32_t kCompactVertexStrideBytes = kCompactVertexFloats * 4;
+inline constexpr std::uint32_t kVertexColor1Offset = kCompactVertexStrideBytes;
+inline constexpr std::uint32_t kVertexUv2Offset = kVertexColor1Offset + 16; // uv3 +8, uv4 +16
+inline constexpr std::uint32_t kVertexTexMtxIdxOffset = kVertexUv2Offset + 24;
+inline constexpr std::uint32_t kVertexTexMtxIdxHiOffset = kVertexTexMtxIdxOffset + 4;
+inline constexpr std::uint32_t kVertexBinormalOffset = kVertexTexMtxIdxHiOffset + 4;
 inline constexpr std::uint32_t kVertexTangentOffset = kVertexBinormalOffset + 12;
+inline constexpr std::uint32_t kFullVertexFloats = (kVertexTangentOffset + 12) / 4;
+inline constexpr std::uint32_t kFullVertexStrideBytes = kFullVertexFloats * 4;
+// The full layout's own part, the default stream's one element.
+inline constexpr std::uint32_t kVertexExtraBytes = kFullVertexStrideBytes - kCompactVertexStrideBytes;
+static_assert(kFullVertexStrideBytes == 132 && kVertexExtraBytes == 72);
+
+// Where uv slot `slot` (0..kMaxTexGens-1) is in either layout.
+constexpr std::uint32_t vertex_uv_offset(std::uint32_t slot) {
+  return slot < 2u ? kVertexUv0Offset + 8u * slot : kVertexUv2Offset + 8u * (slot - 2u);
+}
+
+// Whether a draw with this key is decoded in the full layout (and its
+// pipeline reads every input from the draw's vertices).
+inline bool vertex_layout_full(const ShaderKey& key) {
+  return key.has_color1 != 0 || (key.uv_mask & 0x1Cu) != 0 || key.has_tex_mtx_idx != 0 ||
+         key.has_vertex_binormal != 0 || key.has_vertex_tangent != 0;
+}
 
 // --- Draw plan ---------------------------------------------------------------
 
@@ -567,7 +588,10 @@ struct DrawPlan : DrawPlanFields {
   // comparing them.
   ConstantsInputs constants_inputs{};
   std::uint64_t constants_id = 0;
-  std::vector<float> vertices; // kVertexFloats per vertex
+  // Decoded vertices: vertex_floats per vertex (kCompactVertexFloats, or
+  // kFullVertexFloats when vertex_layout_full(pipeline.shader)).
+  std::uint32_t vertex_floats = kCompactVertexFloats;
+  std::vector<float> vertices;
   std::vector<std::uint16_t> indices;
 };
 

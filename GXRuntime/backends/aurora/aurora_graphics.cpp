@@ -106,7 +106,7 @@ void core_plan_observer(const gxruntime::gxcore::DrawPlan& plan, void*) {
         for (unsigned j = 0; j < 4u; ++j)
             std::fprintf(stderr, " %u/%u/%u", k.litchan[j].matsource, k.litchan[j].ambsource, k.litchan[j].enablelighting);
         {
-            const unsigned stride = gxruntime::gxcore::kVertexFloats;
+            const unsigned stride = plan.vertex_floats;
             for (unsigned v = 0; v < plan.vertex_count && v < 4u; ++v) {
                 const float* p = plan.vertices.data() + v * stride;
                 std::fprintf(stderr, "[plan-tex]   v%u pos=%.1f,%.1f,%.1f col0=%.3f,%.3f,%.3f,%.3f\n", v, p[0], p[1], p[2], p[4], p[5], p[6], p[7]);
