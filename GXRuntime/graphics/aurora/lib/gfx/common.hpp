@@ -199,6 +199,13 @@ extern wgpu::BindGroup g_uniformBindGroup;
 // own area, filled while the frame records and uploaded once when it ends, so
 // they never take room from (or split) the frame's staging.
 extern wgpu::BindGroup g_interpUniformBindGroup;
+// A gxcore draw's vertex block is three dynamic-offset uniform bindings of
+// group 1 (gxruntime/gxcore/shader.hpp kVertexBlockBytes): the draw's own
+// fields, XF matrix memory and the lights. Over the frame's uniform buffer,
+// and over the in-between frames'.
+extern wgpu::BindGroupLayout g_vertexUniformBindGroupLayout;
+extern wgpu::BindGroup g_vertexUniformBindGroup;
+extern wgpu::BindGroup g_interpVertexUniformBindGroup;
 
 using BindGroupRef = HashType;
 using PipelineRef = HashType;
@@ -334,8 +341,17 @@ Range push_interp_vertices(size_t slot, const uint8_t* data, size_t length);
 // At most kInterpMaxSteps of each (frame_interp::kMaxSteps, which common.cpp
 // checks it against).
 constexpr int kInterpMaxSteps = 7;
+// A gxcore draw's vertex block as staged: its three parts' offsets (group 1's
+// dynamic offsets); size 0 when none was.
+struct VertexUniformRanges {
+  uint32_t block = 0;
+  uint32_t matrices = 0;
+  uint32_t lights = 0;
+  uint32_t size = 0;
+  bool operator==(const VertexUniformRanges&) const = default;
+};
 struct InterpRanges {
-  Range uniform[kInterpMaxSteps];
+  VertexUniformRanges uniform[kInterpMaxSteps];
   Range verts[kInterpMaxSteps];
   Range pixel[kInterpMaxSteps]; // a TEV draw's pixel constants with blended colours
 };

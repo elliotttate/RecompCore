@@ -33,10 +33,10 @@ struct DrawData {
   PipelineRef depthPipeline; // early-Z depth-only pass, 0 when unnecessary
   Range vertRange;
   Range idxRange;
-  Range uniformRange;       // VertexShaderConstants (group 1)
+  VertexUniformRanges uniformRange; // VertexShaderConstants' parts (group 1)
   // The constants blended toward the previous frame, used while the
   // in-between frame is encoded (frame_interp.hpp); uniformRange otherwise.
-  Range interpUniformRange;
+  VertexUniformRanges interpUniformRange;
   // And its vertices, for a particle whose positions came in its payload,
   // blended toward the previous frame's (in the in-between vertex area);
   // vertRange otherwise.

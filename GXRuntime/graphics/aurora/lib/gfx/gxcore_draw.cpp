@@ -447,7 +447,8 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   const auto module = g_device.CreateShaderModule(&moduleDescriptor);
 
   // Group 0 keeps the pass preamble's static bind group compatible (the shader
-  // never references it); 1 = shared dynamic VS uniform. On the TEV path (S14)
+  // never references it); 1 = the shared dynamic VS uniform's three parts
+  // (g_vertexUniformBindGroupLayout). On the TEV path (S14)
   // 2 = shared dynamic PS uniform and 3 = texture; else 2 = texture. Putting
   // the PS uniform before the texture keeps an untextured TEV draw gap-free.
   const bool tev = key.shader.tev_valid != 0;
@@ -458,7 +459,7 @@ wgpu::RenderPipeline create_pipeline(const PipelineConfig& config) {
   const uint32_t tex_mask = uber ? 0xFFu : textured ? gxc::used_texmap_mask(key.shader) : 1u;
   std::array<wgpu::BindGroupLayout, 4> bindGroupLayouts{
       g_staticBindGroupLayout,
-      g_uniformBindGroupLayout,
+      g_vertexUniformBindGroupLayout,
       tev || uber ? g_uniformBindGroupLayout : texture_bind_group_layout(tex_mask),
       texture_bind_group_layout(tex_mask),
   };
@@ -722,7 +723,7 @@ struct PassState {
   bool indexBound = false;
   PipelineRef pipeline = 0;
   WGPUBindGroup group1 = nullptr;
-  uint32_t offset1 = UINT32_MAX;
+  std::array<uint32_t, 3> offset1{UINT32_MAX, UINT32_MAX, UINT32_MAX};
   WGPUBindGroup group2 = nullptr;
   uint32_t offset2 = UINT32_MAX;
   WGPUBindGroup group3 = nullptr;
@@ -760,7 +761,7 @@ const wgpu::Buffer& vertex_extra_defaults() {
 // own), its indices, and its first vertex from the batch's.
 namespace {
 struct DrawPart {
-  Range uniform;
+  VertexUniformRanges uniform;
   Range verts;
   Range pixel;
   uint32_t firstIndex;
@@ -803,8 +804,9 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   // traced frame's own, matched while recording, are one step's).
   const bool interpolated = frame_interp::encoding_interpolated();
   const int step = interpolated ? interp_replay_step() : 0;
-  const auto job_ranges = [&](uint32_t job, Range& uniform, Range& verts, Range& pixel) {
-    uniform = verts = pixel = {};
+  const auto job_ranges = [&](uint32_t job, VertexUniformRanges& uniform, Range& verts, Range& pixel) {
+    uniform = {};
+    verts = pixel = {};
     if (!interpolated)
       return;
     if (data.interpJob != UINT32_MAX) {
@@ -832,10 +834,11 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
   bool asOne = true;
   if (interpolated && data.batchSize > 1 && data.interpJob != UINT32_MAX) {
     for (uint32_t i = 1; i < data.batchSize && asOne; ++i) {
-      Range uniform, verts, pixel;
+      VertexUniformRanges uniform;
+      Range verts, pixel;
       job_ranges(data.interpJob + i, uniform, verts, pixel);
       const uint32_t first = batch_draw(data.batch + i).firstVertex;
-      asOne = uniform.offset == whole.uniform.offset && uniform.size == whole.uniform.size &&
+      asOne = uniform == whole.uniform &&
               pixel.offset == whole.pixel.offset && pixel.size == whole.pixel.size &&
               (whole.verts.size == 0 ? verts.size == 0
                                      : verts.size != 0 && verts.offset == whole.verts.offset +
@@ -857,12 +860,13 @@ void render(const DrawData& data, const wgpu::RenderPassEncoder& pass) {
 
   const auto setGroup1 = [&](const DrawPart& part) {
     const bool blended = part.uniform.size != 0;
-    const auto& vsGroup = blended ? g_interpUniformBindGroup : g_uniformBindGroup;
-    const uint32_t vsOffset = blended ? part.uniform.offset : data.uniformRange.offset;
-    if (vsGroup.Get() != g_pass.group1 || vsOffset != g_pass.offset1) {
-      pass.SetBindGroup(1, vsGroup, 1, &vsOffset);
+    const auto& vsGroup = blended ? g_interpVertexUniformBindGroup : g_vertexUniformBindGroup;
+    const VertexUniformRanges& vs = blended ? part.uniform : data.uniformRange;
+    const std::array<uint32_t, 3> offsets{vs.block, vs.matrices, vs.lights};
+    if (vsGroup.Get() != g_pass.group1 || offsets != g_pass.offset1) {
+      pass.SetBindGroup(1, vsGroup, offsets.size(), offsets.data());
       g_pass.group1 = vsGroup.Get();
-      g_pass.offset1 = vsOffset;
+      g_pass.offset1 = offsets;
     }
   };
   // The vertices: from the whole buffer at the draw's (or batch's) base
@@ -1105,12 +1109,17 @@ struct UniformCache {
   std::vector<uint8_t> bytes; // the block range holds
 #endif
 };
-static UniformCache g_vertexUniformCache;
-// The constants_id of the plan whose constants g_vertexUniformCache holds the bytes of (0: none).
-static uint64_t g_pushedConstantsId = 0;
-static UniformCache g_interpUniformCache;
 static UniformCache g_pixelUniformCache;
 static UniformCache g_uberPixelUniformCache;
+
+// DOL_AURORA_UNIFORM_DEDUP=0: every draw stages its blocks (debug).
+static bool uniform_dedup_enabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("DOL_AURORA_UNIFORM_DEDUP");
+    return env == nullptr || env[0] != '0';
+  }();
+  return enabled;
+}
 
 // The ubershader's texture for a texmap slot no TEV stage samples: one white
 // texel, made once per device (the ubershader's bind group has all eight).
@@ -1163,14 +1172,6 @@ static void keep_cached(UniformCache& cache, const uint8_t* data, size_t length)
 #endif
 }
 
-// Whether `data` is the block the cache last took, in this frame packet.
-static bool repeats_cached(const UniformCache& cache, const uint8_t* data, size_t length) {
-  const uint64_t frameId = current_frame_id();
-  return frameId != 0 && cache.frameId == frameId && cache.range.size == length &&
-         std::memcmp(cached_bytes(cache, AURORA_UNIFORM_COMPARE_STAGED ? uniform_bytes(cache.range) : nullptr), data,
-                     length) == 0;
-}
-
 // The in-between frame's blocks, de-duplicated the same way. repeated: the
 // in-between frame made this block the way
 // it made the last one, from the same constants (frame_interp::last_blend_repeated),
@@ -1192,6 +1193,105 @@ static Range push_interp_uniform_dedup(UniformCache& cache, uint64_t frameId, si
   return cache.range;
 }
 
+// The vertex block's three parts (gxc::kVertexBlockBytes), each de-duplicated
+// on its own against the one it last staged in this frame packet: a draw's own
+// fields change nearly every draw, matrix memory with them, the lights rarely.
+// A part is staged from its first field as far as the draw's shader reads it
+// (gxc::vertex_uniform_use); a part the shader does not bind is not staged,
+// and its binding keeps any valid offset (the part's last).
+namespace {
+struct VertexPartCache {
+  Range range{};
+  size_t staged = 0;    // the leading bytes staged at range.offset
+  uint64_t frameId = 0;
+  uint64_t serial = 0;  // the last draw that bound this part (in its frame packet)
+  size_t matched = 0;   // the leading bytes known to be that draw's
+#if !AURORA_UNIFORM_COMPARE_STAGED
+  std::vector<uint8_t> bytes; // the staged bytes
+#endif
+};
+struct VertexPartCaches {
+  VertexPartCache part[3];
+  uint64_t serial = 0; // draws staged through these caches
+};
+// Where a draw's parts go: the frame's uniform area, or an in-between frame's
+// (push_interp_uniform's slot).
+constexpr size_t kFrameUniforms = SIZE_MAX;
+} // namespace
+
+static const uint8_t* cached_bytes_of(const VertexPartCache& cache, const uint8_t* staged) {
+#if AURORA_UNIFORM_COMPARE_STAGED
+  (void)cache;
+  return staged;
+#else
+  (void)staged;
+  return cache.bytes.data();
+#endif
+}
+
+// The parts of `constants` a draw whose shader reads `use` of them binds, into
+// `out`. repeats: the constants are those of the draw before through these
+// caches (repeatsLast, or frame_interp::last_blend_repeated), so a part that
+// draw bound, known the same as far as this one reads, needs no comparison.
+// False when an in-between frame's area is full.
+static bool stage_vertex_parts(VertexPartCaches& caches, uint64_t frameId, size_t slot,
+                               const gxc::VertexShaderConstants& constants, const gxc::VertexUniformUse& use,
+                               bool repeats, VertexUniformRanges& out) {
+  const auto* base = reinterpret_cast<const uint8_t*>(&constants);
+  const size_t starts[3] = {0, gxc::kVertexMatrixOffset, gxc::kVertexLightOffset};
+  const size_t reads[3] = {use.block, use.matrices, use.lights};
+  const uint64_t serial = ++caches.serial;
+  uint32_t offsets[3];
+  for (int i = 0; i < 3; ++i) {
+    VertexPartCache& cache = caches.part[i];
+    const uint8_t* data = base + starts[i];
+    const bool current = frameId != 0 && cache.frameId == frameId && cache.range.size != 0;
+    if (reads[i] == 0) {
+      offsets[i] = current ? cache.range.offset : 0u;
+      continue;
+    }
+    if (current && cache.staged >= reads[i] && uniform_dedup_enabled()) {
+      const uint8_t* staged = AURORA_UNIFORM_COMPARE_STAGED
+                                  ? (slot == kFrameUniforms ? uniform_bytes(cache.range)
+                                                            : interp_uniform_bytes(slot, cache.range))
+                                  : nullptr;
+      if (repeats && cache.serial == serial - 1 && cache.matched >= reads[i]) {
+        cache.serial = serial;
+        offsets[i] = cache.range.offset;
+        continue;
+      }
+      if (std::memcmp(cached_bytes_of(cache, staged), data, reads[i]) == 0) {
+        cache.serial = serial;
+        cache.matched = reads[i];
+        offsets[i] = cache.range.offset;
+        continue;
+      }
+    }
+    const Range range = slot == kFrameUniforms ? push_uniform(data, reads[i]) : push_interp_uniform(slot, data, reads[i]);
+    if (range.size == 0)
+      return false;
+    cache.range = range;
+    cache.staged = cache.matched = reads[i];
+    cache.frameId = frameId;
+    cache.serial = serial;
+#if !AURORA_UNIFORM_COMPARE_STAGED
+    cache.bytes.assign(data, data + reads[i]);
+#endif
+    offsets[i] = range.offset;
+  }
+  out = VertexUniformRanges{.block = offsets[0], .matrices = offsets[1], .lights = offsets[2], .size = 1u};
+  return true;
+}
+
+// The frame's vertex blocks as staged, and a traced frame's in-between ones.
+static VertexPartCaches g_vertexParts;
+static VertexPartCaches g_interpParts;
+// The constants of the draw before in this frame packet, which a draw's are
+// compared with (repeatsLast), and that draw's constants_id.
+static gxc::VertexShaderConstants g_lastConstants;
+static uint64_t g_lastConstantsFrame = 0;
+static uint64_t g_lastConstantsId = 0;
+
 // --- In-between frames on a helper thread -----------------------------------
 //
 // Matching each draw to its counterpart in the frame before and blending its
@@ -1210,7 +1310,8 @@ struct InterpJob {
   uint32_t vertexFloats = gxc::kCompactVertexFloats; // and their layout's
   uint64_t frameId;
   size_t slot;
-  bool repeatsLastDraw; // the constants are the draw before's (repeats_cached)
+  gxc::VertexUniformUse uniformUse; // what its shader reads of the vertex block's parts
+  bool repeatsLastDraw; // the constants are the draw before's (repeatsLast)
   // The constants, copied only where they differ from the job before's
   // (constantsCopied); a job that repeats them leaves the 2.8 KB copy to the
   // helper, which keeps the last it was given (InterpHelper::constants).
@@ -1267,7 +1368,7 @@ struct InterpHelper {
   uint32_t jobs = 0;
   bool pixelCarried = false;
   // Helper thread: the last block it staged per step, and a particle's vertices.
-  UniformCache cache[frame_interp::kMaxSteps];
+  VertexPartCaches cache[frame_interp::kMaxSteps];
   UniformCache pixelCache[frame_interp::kMaxSteps];
   std::vector<float> vertices;
   // Helper thread: the constants of the last job that carried them, which the
@@ -1321,10 +1422,9 @@ void interp_helper_main(InterpHelper* h) {
         nullptr) {
       const bool repeated = frame_interp::last_blend_repeated();
       for (int step = 0; step < steps; ++step)
-        ranges.uniform[step] =
-            push_interp_uniform_dedup(h->cache[step], job.frameId, job.slot,
-                                      reinterpret_cast<const uint8_t*>(frame_interp::blended_step(step)),
-                                      sizeof(gxc::VertexShaderConstants), repeated);
+        if (!stage_vertex_parts(h->cache[step], job.frameId, job.slot, *frame_interp::blended_step(step),
+                                job.uniformUse, repeated, ranges.uniform[step]))
+          ranges.uniform[step] = {};
     }
     for (int step = 0; step < steps; ++step) {
       const float* positions = frame_interp::blended_positions(step);
@@ -1415,7 +1515,7 @@ bool positions_written(const gxc::DrawPlan& plan) {
 }
 
 uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw, bool tev, bool pixelRepeats,
-                          bool positionsWritten) {
+                          bool positionsWritten, const gxc::VertexUniformUse& uniformUse) {
   InterpHelper* h = g_interpHelper.load(std::memory_order_acquire);
   if (h == nullptr) {
     h = new InterpHelper;
@@ -1440,6 +1540,7 @@ uint32_t queue_interp_job(const gxc::DrawPlan& plan, bool repeatsLastDraw, bool 
   job.vertexFloats = plan.vertex_floats;
   job.frameId = frameId;
   job.slot = recording_frame_slot();
+  job.uniformUse = uniformUse;
   job.repeatsLastDraw = repeatsLastDraw;
   // repeatsLastDraw: the constants are those last pushed in this frame packet,
   // and every push while frames are interpolated here queues a job, so they
@@ -1493,19 +1594,11 @@ void wait_interp_jobs() {
   });
 }
 
-// known: 1 or 0 when the caller has already compared `data` with the cache's
-// block (repeats_cached), -1 to compare here.
-static Range push_uniform_dedup(UniformCache& cache, const uint8_t* data,
-                                size_t length, int known = -1) {
-  static const bool enabled = [] {
-    const char* env = std::getenv("DOL_AURORA_UNIFORM_DEDUP");
-    return env == nullptr || env[0] != '0';
-  }();
+static Range push_uniform_dedup(UniformCache& cache, const uint8_t* data, size_t length) {
   const uint64_t frameId = current_frame_id();
-  if (enabled && frameId != 0 && cache.frameId == frameId && cache.range.size == length &&
-      (known >= 0 ? known == 1
-                  : std::memcmp(cached_bytes(cache, AURORA_UNIFORM_COMPARE_STAGED ? uniform_bytes(cache.range) : nullptr),
-                                data, length) == 0)) {
+  if (uniform_dedup_enabled() && frameId != 0 && cache.frameId == frameId && cache.range.size == length &&
+      std::memcmp(cached_bytes(cache, AURORA_UNIFORM_COMPARE_STAGED ? uniform_bytes(cache.range) : nullptr), data,
+                  length) == 0) {
     ++cache.hits;
     return cache.range;
   }
@@ -1967,14 +2060,14 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   // the draw before them, 96 percent of the Forsaken Fortress's 17,500 a frame,
   // and each comparison of equal blocks reads all 2.8 KB of both.
   // A plan whose constants were kept from the draw before (constants_id, set
-  // by GxCoreState::build_draw_plan_into) is known to repeat the block last
-  // pushed in this frame packet without comparing them; constants made anew
-  // are compared (they may still be the same bytes).
+  // by GxCoreState::build_draw_plan_into) is known to repeat them without
+  // comparing; constants made anew are compared with a copy of the last
+  // (they may still be the same bytes).
   const uint64_t frameId = current_frame_id();
   const bool repeatsLast =
-      (plan.constants_id != 0 && frameId != 0 && plan.constants_id == g_pushedConstantsId &&
-       g_vertexUniformCache.frameId == frameId && g_vertexUniformCache.range.size == sizeof(plan.constants)) ||
-      repeats_cached(g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants), sizeof(plan.constants));
+      frameId != 0 && g_lastConstantsFrame == frameId &&
+      ((plan.constants_id != 0 && plan.constants_id == g_lastConstantsId) ||
+       std::memcmp(&g_lastConstants, &plan.constants, sizeof(plan.constants)) == 0);
   // In-between frames: matched on the helper thread (queued below), or here
   // while a traced frame reports each draw's outcome. Here it is matched
   // before a staging segment can split the frame; a split frame is not
@@ -2042,20 +2135,6 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     }
   }
 
-  const auto uniformRange = push_uniform_dedup(
-      g_vertexUniformCache, reinterpret_cast<const uint8_t*>(&plan.constants),
-      sizeof(plan.constants), repeatsLast ? 1 : 0);
-  g_pushedConstantsId = plan.constants_id;
-  Range pixelUniformRange{};
-  bool pixelRepeats = false;
-  if (tev) {
-    const uint64_t hits = g_pixelUniformCache.hits;
-    pixelUniformRange = push_uniform_dedup(
-        g_pixelUniformCache,
-        reinterpret_cast<const uint8_t*>(&plan.pixel_constants),
-        sizeof(plan.pixel_constants));
-    pixelRepeats = g_pixelUniformCache.hits != hits;
-  }
   const PipelineConfig colorConfig{
       .version = GXCorePipelineConfigVersion,
       .key = plan.pipeline,
@@ -2157,6 +2236,29 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     }
   }
 
+  // The vertex block's parts, each as far as the draw's shader reads it (all
+  // of each for a draw the ubershader may draw, which reads by the key).
+  const gxc::VertexUniformUse uniformUse =
+      uberPipeline != 0
+          ? gxc::VertexUniformUse{gxc::kVertexBlockBytes, gxc::kVertexMatrixBytes, gxc::kVertexLightBytes}
+          : gxc::vertex_uniform_use(plan.pipeline.shader);
+  VertexUniformRanges uniformRange{};
+  stage_vertex_parts(g_vertexParts, frameId, kFrameUniforms, plan.constants, uniformUse, repeatsLast, uniformRange);
+  if (!repeatsLast)
+    std::memcpy(&g_lastConstants, &plan.constants, sizeof(plan.constants));
+  g_lastConstantsFrame = frameId;
+  g_lastConstantsId = plan.constants_id;
+  Range pixelUniformRange{};
+  bool pixelRepeats = false;
+  if (tev) {
+    const uint64_t hits = g_pixelUniformCache.hits;
+    pixelUniformRange = push_uniform_dedup(
+        g_pixelUniformCache,
+        reinterpret_cast<const uint8_t*>(&plan.pixel_constants),
+        sizeof(plan.pixel_constants));
+    pixelRepeats = g_pixelUniformCache.hits != hits;
+  }
+
   // Batching: a draw of the state of the pass's last command (pipeline,
   // constants, pixel constants, textures), with nothing between them, whose
   // vertices and indices follow its, extends it, its indices counted from the
@@ -2179,7 +2281,7 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
     DrawData* last = last_recorded_draw();
     if (last != nullptr && uberPipeline == 0 && last->uberPipeline == 0 && last->pipeline == pipeline &&
         last->depthPipeline == depthPipeline &&
-        last->uniformRange.offset == uniformRange.offset && last->tev == tev &&
+        last->uniformRange == uniformRange && last->tev == tev &&
         (!tev || last->pixelUniformRange.offset == pixelUniformRange.offset) &&
         last->textureBindGroup == textureBindGroup && last->ownVertices == ownVertices &&
         last->interpUniformRange.size == 0 && last->interpVertRange.size == 0 &&
@@ -2210,14 +2312,15 @@ bool submit_draw_plan(const gxc::DrawPlan& plan) {
   } else {
     idxRange = push_indices(reinterpret_cast<const uint8_t*>(plan.indices.data()), indexBytes, 2);
   }
-  Range interpUniformRange{};
+  VertexUniformRanges interpUniformRange{};
   uint32_t interpJob = UINT32_MAX;
-  if (interpConstants != nullptr)
-    interpUniformRange = push_interp_uniform_dedup(
-        g_interpUniformCache, current_frame_id(), recording_frame_slot(), reinterpret_cast<const uint8_t*>(interpConstants),
-        sizeof(*interpConstants), frame_interp::last_blend_repeated());
-  else if (interpolating && !matchHere)
-    interpJob = queue_interp_job(plan, repeatsLast, tev, pixelRepeats, positionsWritten);
+  if (interpConstants != nullptr) {
+    if (!stage_vertex_parts(g_interpParts, current_frame_id(), recording_frame_slot(), *interpConstants, uniformUse,
+                            frame_interp::last_blend_repeated(), interpUniformRange))
+      interpUniformRange = {};
+  } else if (interpolating && !matchHere) {
+    interpJob = queue_interp_job(plan, repeatsLast, tev, pixelRepeats, positionsWritten, uniformUse);
+  }
 
   const auto indexCount = static_cast<uint32_t>(plan.indices.size());
   if (batch != nullptr) {

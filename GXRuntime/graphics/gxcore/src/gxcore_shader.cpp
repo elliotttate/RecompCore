@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "gxruntime/gxcore/shader.hpp"
 
+#include <algorithm>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -601,34 +603,34 @@ void emit_light(std::string& out, const LightChanKey& ch, int i, bool alpha) {
   switch (attn) {
   case AttenuationFunc::None:
   case AttenuationFunc::Dir:
-    emitf(out, "            ldir = normalize(vsc.lights[%d].pos.xyz - pos);\n", i);
+    emitf(out, "            ldir = normalize(vsl.lights[%d].pos.xyz - pos);\n", i);
     emit(out, "            attn = 1.0;\n"
               "            if (length(ldir) == 0.0) { ldir = _normal; }\n");
     break;
   case AttenuationFunc::Spec:
-    emitf(out, "            ldir = normalize(vsc.lights[%d].pos.xyz - pos);\n", i);
+    emitf(out, "            ldir = normalize(vsl.lights[%d].pos.xyz - pos);\n", i);
     emitf(out,
           "            attn = select(0.0, max(0.0, dot(_normal, "
-          "vsc.lights[%d].dir.xyz)), dot(_normal, ldir) >= 0.0);\n",
+          "vsl.lights[%d].dir.xyz)), dot(_normal, ldir) >= 0.0);\n",
           i);
-    emitf(out, "            cosAttn = vsc.lights[%d].cosatt.xyz;\n", i);
+    emitf(out, "            cosAttn = vsl.lights[%d].cosatt.xyz;\n", i);
     if (diff == DiffuseFunc::None)
-      emitf(out, "            distAttn = vsc.lights[%d].distatt.xyz;\n", i);
+      emitf(out, "            distAttn = vsl.lights[%d].distatt.xyz;\n", i);
     else
-      emitf(out, "            distAttn = normalize(vsc.lights[%d].distatt.xyz);\n", i);
+      emitf(out, "            distAttn = normalize(vsl.lights[%d].distatt.xyz);\n", i);
     emit(out, "            attn = max(0.0, dot(cosAttn, vec3f(1.0, attn, "
               "attn*attn))) / dot(distAttn, vec3f(1.0, attn, attn*attn));\n");
     break;
   case AttenuationFunc::Spot:
-    emitf(out, "            ldir = vsc.lights[%d].pos.xyz - pos;\n", i);
+    emitf(out, "            ldir = vsl.lights[%d].pos.xyz - pos;\n", i);
     emit(out, "            dist2 = dot(ldir, ldir);\n"
               "            dist = sqrt(dist2);\n"
               "            ldir = ldir / dist;\n");
-    emitf(out, "            attn = max(0.0, dot(ldir, vsc.lights[%d].dir.xyz));\n", i);
+    emitf(out, "            attn = max(0.0, dot(ldir, vsl.lights[%d].dir.xyz));\n", i);
     emitf(out,
-          "            attn = max(0.0, vsc.lights[%d].cosatt.x + "
-          "vsc.lights[%d].cosatt.y*attn + vsc.lights[%d].cosatt.z*attn*attn) / "
-          "dot(vsc.lights[%d].distatt.xyz, vec3f(1.0, dist, dist2));\n",
+          "            attn = max(0.0, vsl.lights[%d].cosatt.x + "
+          "vsl.lights[%d].cosatt.y*attn + vsl.lights[%d].cosatt.z*attn*attn) / "
+          "dot(vsl.lights[%d].distatt.xyz, vec3f(1.0, dist, dist2));\n",
           i, i, i, i);
     break;
   }
@@ -640,12 +642,12 @@ void emit_light(std::string& out, const LightChanKey& ch, int i, bool alpha) {
   if (!alpha) {
     emitf(out,
           "            lacc = lacc + vec4i(vec3i(round(attn * %svec3f("
-          "vsc.lights[%d].color.rgb))), 0);\n",
+          "vsl.lights[%d].color.rgb))), 0);\n",
           dterm, i);
   } else {
     emitf(out,
           "            lacc.a = lacc.a + i32(round(attn * %sf32("
-          "vsc.lights[%d].color.a)));\n",
+          "vsl.lights[%d].color.a)));\n",
           dterm, i);
   }
   emit(out, "        }\n");
@@ -734,6 +736,65 @@ bool channel_lit_path(const ShaderKey& k, unsigned j) {
          static_cast<MatSource>(alp.matsource) == MatSource::Register;
 }
 
+namespace {
+// What a key's shader declares of the three uniform parts (generate_wgsl's
+// conditions, decided once for the WGSL and vertex_uniform_use).
+struct UniformDecl {
+  bool materials = false;   // vsc.materials (and before cached_*)
+  bool cached = false;      // vsc.cached_normal/tangent/binormal
+  bool matrices = false;    // the vsm binding: transformmatrices
+  bool normal_bank = false; // and vsm.normalmatrices
+  bool lights = false;      // the vsl binding
+};
+
+UniformDecl uniform_decl(const ShaderKey& key) {
+  const bool lit = key.lit_valid != 0;
+  bool needs_color1 = false;
+  bool has_emboss = false;
+  bool per_vertex_texmtx = false;
+  for (std::uint32_t i = 0; i < key.num_tex_gens; ++i) {
+    const auto t = static_cast<TexGenType>(key.tex_gens[i].texgentype);
+    if (t == TexGenType::Color1)
+      needs_color1 = true;
+    else if (t == TexGenType::EmbossMap)
+      has_emboss = true;
+    else if (t == TexGenType::Regular && key.has_tex_mtx_idx != 0 &&
+             (key.tex_mtx_idx_mask & (1u << i)) != 0u)
+      per_vertex_texmtx = true;
+  }
+  const bool emit_color1 = key.tev_valid != 0 || needs_color1;
+  const bool chan0_lit = channel_lit_path(key, 0u);
+  const bool chan1_lit = emit_color1 && channel_lit_path(key, 1u);
+  UniformDecl d;
+  d.cached = ((chan0_lit || chan1_lit) && lit && key.has_vertex_normal == 0) ||
+             (has_emboss && (key.has_vertex_tangent == 0 || key.has_vertex_binormal == 0));
+  // cached_* follow materials in the block, so declaring them declares it.
+  d.materials = chan0_lit || chan1_lit || d.cached;
+  d.normal_bank = key.has_pos_mtx_idx != 0 && (lit || has_emboss);
+  d.matrices = key.has_pos_mtx_idx != 0 || per_vertex_texmtx;
+  d.lights = lit || has_emboss || chan0_lit || chan1_lit;
+  return d;
+}
+} // namespace
+
+VertexUniformUse vertex_uniform_use(const ShaderKey& key) {
+  const UniformDecl d = uniform_decl(key);
+  VertexUniformUse use{};
+  if (d.cached)
+    use.block = offsetof(VertexShaderConstants, cached_binormal) + sizeof(VertexShaderConstants::cached_binormal);
+  else if (d.materials)
+    use.block = offsetof(VertexShaderConstants, cached_normal);
+  else // A texgen's static matrix: texmatrices rows 3i to 3i + 2.
+    use.block = static_cast<std::uint32_t>(
+        offsetof(VertexShaderConstants, texmatrices) +
+        std::min<std::uint32_t>(key.num_tex_gens, 8u) * 3u * sizeof(VertexShaderConstants::texmatrices[0]));
+  if (d.matrices)
+    use.matrices = d.normal_bank ? kVertexMatrixBytes : sizeof(VertexShaderConstants::transformmatrices);
+  if (d.lights)
+    use.lights = kVertexLightBytes;
+  return use;
+}
+
 std::string generate_wgsl(const ShaderKey& key) {
 
   std::string out;
@@ -761,8 +822,8 @@ std::string generate_wgsl(const ShaderKey& key) {
       has_normal_source = true;
   }
   // Emboss transforms the light dir into tangent space, so the lights uniform +
-  // the NBT binormal/tangent vertex attrs must be present even on an unlit draw.
-  const bool emit_lights = lit || has_emboss;
+  // the NBT binormal/tangent vertex attrs must be present even on an unlit draw
+  // (uniform_decl).
   const bool emit_nbt = has_emboss; // binormal/tangent vertex inputs required
   // color1 occupies @location(1) whenever it is emitted; texcoords shift up one.
   const bool emit_color1 = tev || needs_color1;
@@ -773,12 +834,9 @@ std::string generate_wgsl(const ShaderKey& key) {
   const bool chan1_lit = emit_color1 && channel_lit_path(key, 1u);
   const bool needs_normal_bank =
       key.has_pos_mtx_idx != 0 && (lit || has_emboss);
-  // The lit path reads vsc.materials (register material/ambient) and, when a
-  // light is enabled, vsc.lights. Whenever either the light path or a
-  // register-material channel is active we must expose the full uniform view
-  // (both fields, in the fixed C struct order) so offsets line up.
-  const bool needs_uniform_full =
-      emit_lights || chan0_lit || chan1_lit || needs_normal_bank;
+  // The uniform parts this shader declares: the lit path reads vsc.materials
+  // (register material/ambient) and, when a light is enabled, vsl.lights.
+  const UniformDecl decl = uniform_decl(key);
   // Vertex-format N/B/T presence. A lit/emboss draw whose format omits an
   // attribute substitutes the cross-draw cached value from the uniform
   // (Dolphin I_CACHED_NORMAL fallback, VertexShaderGen.cpp:607-632) instead of
@@ -799,41 +857,46 @@ std::string generate_wgsl(const ShaderKey& key) {
   // laid out normal, tangent, binormal — skipping one mid-run would misplace a
   // later one). Only emitted when actually used, so formats that carry the
   // attribute keep byte-identical goldens.
-  const bool uses_cached =
-      uses_cached_normal || uses_cached_tangent || uses_cached_binormal;
-  // normalmatrices is the final C-uniform field. A shader that declares it
-  // must also retain every preceding field so its WGSL offset stays identical.
-  const bool declare_cached_fields = uses_cached || needs_normal_bank;
+  (void)uses_cached_normal;
+  (void)uses_cached_tangent;
+  (void)uses_cached_binormal;
 
+  // Each part declares its leading fields only (a smaller WGSL struct over the
+  // same binding is valid), in the C struct's order so offsets line up; the
+  // matrix-memory and light parts are bound only when read.
   emit(out, "// gxcore generated shader (Dolphin VertexShaderGen shape)\n");
-  if (needs_uniform_full)
+  emit(out, "struct VertexShaderConstants {\n"
+            "    posnormalmatrix: array<vec4f, 6>,\n"
+            "    projection: array<vec4f, 4>,\n"
+            "    texmatrices: array<vec4f, 24>,\n");
+  if (decl.materials)
+    emit(out, "    materials: array<vec4i, 4>,\n");
+  if (decl.cached)
+    emit(out, "    cached_normal: vec4f,\n"
+              "    cached_tangent: vec4f,\n"
+              "    cached_binormal: vec4f,\n");
+  emit(out, "};\n"
+            "@group(1) @binding(0) var<uniform> vsc: VertexShaderConstants;\n");
+  if (decl.matrices) {
+    emit(out, "struct VertexMatrices {\n"
+              "    transformmatrices: array<vec4f, 64>,\n");
+    if (decl.normal_bank)
+      emit(out, "    normalmatrices: array<vec4f, 32>,\n");
+    emit(out, "};\n"
+              "@group(1) @binding(1) var<uniform> vsm: VertexMatrices;\n");
+  }
+  if (decl.lights)
     emit(out, "struct Light {\n"
               "    color: vec4i,\n"
               "    cosatt: vec4f,\n"
               "    distatt: vec4f,\n"
               "    pos: vec4f,\n"
               "    dir: vec4f,\n"
-              "};\n");
-  emit(out, "struct VertexShaderConstants {\n"
-            "    posnormalmatrix: array<vec4f, 6>,\n"
-            "    projection: array<vec4f, 4>,\n"
-            "    texmatrices: array<vec4f, 24>,\n"
-            "    transformmatrices: array<vec4f, 64>,\n");
-  // The lit/emboss/register-material path binds the full uniform buffer (lights
-  // + materials); the plain path declares only the leading fields (a smaller
-  // WGSL struct over the same buffer is valid), keeping every existing golden
-  // byte-identical.
-  if (needs_uniform_full)
-    emit(out, "    lights: array<Light, 8>,\n"
-              "    materials: array<vec4i, 4>,\n");
-  if (declare_cached_fields)
-    emit(out, "    cached_normal: vec4f,\n"
-              "    cached_tangent: vec4f,\n"
-              "    cached_binormal: vec4f,\n");
-  if (needs_normal_bank)
-    emit(out, "    normalmatrices: array<vec4f, 32>,\n");
-  emit(out, "};\n"
-            "@group(1) @binding(0) var<uniform> vsc: VertexShaderConstants;\n");
+              "};\n"
+              "struct VertexLights {\n"
+              "    lights: array<Light, 8>,\n"
+              "};\n"
+              "@group(1) @binding(2) var<uniform> vsl: VertexLights;\n");
   if (tev) {
     // PixelShaderConstants (Dolphin I_COLORS/I_KCOLORS/I_ALPHA). Integer TEV.
     // group(2) here (texture shifts to group(3)) so an untextured TEV draw
@@ -929,9 +992,9 @@ std::string generate_wgsl(const ShaderKey& key) {
             "    var o: VertexOut;\n");
   if (key.has_pos_mtx_idx != 0) {
     emit(out, "    let posidx = i32(in.posmtx);\n"
-              "    let p0 = vsc.transformmatrices[posidx];\n"
-              "    let p1 = vsc.transformmatrices[posidx + 1];\n"
-              "    let p2 = vsc.transformmatrices[posidx + 2];\n");
+              "    let p0 = vsm.transformmatrices[posidx];\n"
+              "    let p1 = vsm.transformmatrices[posidx + 1];\n"
+              "    let p2 = vsm.transformmatrices[posidx + 2];\n");
     if (needs_normal_bank)
       emit(out, "    let normidx = posidx & 31;\n");
   } else {
@@ -969,9 +1032,9 @@ std::string generate_wgsl(const ShaderKey& key) {
     // there are none, leaving the material term intact.
     if (lit && needs_normal_bank)
       emitf(out, "    let _normal = normalize(vec3f("
-                 "dot(vsc.normalmatrices[normidx].xyz, %s), "
-                 "dot(vsc.normalmatrices[normidx + 1].xyz, %s), "
-                 "dot(vsc.normalmatrices[normidx + 2].xyz, %s)));\n",
+                 "dot(vsm.normalmatrices[normidx].xyz, %s), "
+                 "dot(vsm.normalmatrices[normidx + 1].xyz, %s), "
+                 "dot(vsm.normalmatrices[normidx + 2].xyz, %s)));\n",
             normal_in, normal_in, normal_in);
     else if (lit)
       emitf(out, "    let _normal = normalize(vec3f("
@@ -1048,9 +1111,9 @@ std::string generate_wgsl(const ShaderKey& key) {
           emitf(out,
                 "        let ti%u = (in.texmtxidx_hi >> (8u * %uu)) & 0xFFu;\n",
                 i, i - 4u);
-        emitf(out, "        let m%u0 = vsc.transformmatrices[ti%u];\n", i, i);
-        emitf(out, "        let m%u1 = vsc.transformmatrices[ti%u + 1u];\n", i, i);
-        emitf(out, "        let m%u2 = vsc.transformmatrices[ti%u + 2u];\n", i, i);
+        emitf(out, "        let m%u0 = vsm.transformmatrices[ti%u];\n", i, i);
+        emitf(out, "        let m%u1 = vsm.transformmatrices[ti%u + 1u];\n", i, i);
+        emitf(out, "        let m%u2 = vsm.transformmatrices[ti%u + 2u];\n", i, i);
         if (tg.projection != 0u)
           emitf(out, "        var uv = vec3f(dot(coord, m%u0), dot(coord, m%u1), "
                      "dot(coord, m%u2));\n",
@@ -1087,14 +1150,14 @@ std::string generate_wgsl(const ShaderKey& key) {
       // Tangent/binormal go to view space via the normal matrix (rows 3-5).
       if (needs_normal_bank) {
         emitf(out, "        let tn%u = vec3f("
-                   "dot(vsc.normalmatrices[normidx].xyz, %s), "
-                   "dot(vsc.normalmatrices[normidx + 1].xyz, %s), "
-                   "dot(vsc.normalmatrices[normidx + 2].xyz, %s));\n",
+                   "dot(vsm.normalmatrices[normidx].xyz, %s), "
+                   "dot(vsm.normalmatrices[normidx + 1].xyz, %s), "
+                   "dot(vsm.normalmatrices[normidx + 2].xyz, %s));\n",
               i, tangent_in, tangent_in, tangent_in);
         emitf(out, "        let bn%u = vec3f("
-                   "dot(vsc.normalmatrices[normidx].xyz, %s), "
-                   "dot(vsc.normalmatrices[normidx + 1].xyz, %s), "
-                   "dot(vsc.normalmatrices[normidx + 2].xyz, %s));\n",
+                   "dot(vsm.normalmatrices[normidx].xyz, %s), "
+                   "dot(vsm.normalmatrices[normidx + 1].xyz, %s), "
+                   "dot(vsm.normalmatrices[normidx + 2].xyz, %s));\n",
               i, binormal_in, binormal_in, binormal_in);
       } else {
         emitf(out, "        let tn%u = vec3f("
@@ -1108,7 +1171,7 @@ std::string generate_wgsl(const ShaderKey& key) {
                    "dot(vsc.posnormalmatrix[5].xyz, %s));\n",
               i, binormal_in, binormal_in, binormal_in);
       }
-      emitf(out, "        let ld%u = normalize(vsc.lights[%uu].pos.xyz - "
+      emitf(out, "        let ld%u = normalize(vsl.lights[%uu].pos.xyz - "
                  "viewpos.xyz);\n",
             i, static_cast<unsigned>(tg.embosslightshift));
       emitf(out, "        o.uv%u = o.uv%u + vec3f(dot(ld%u, tn%u), "

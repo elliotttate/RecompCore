@@ -159,6 +159,25 @@ wgpu::BindGroupLayout g_staticBindGroupLayout;
 wgpu::BindGroup g_staticBindGroup;
 wgpu::BindGroupLayout g_uniformBindGroupLayout;
 wgpu::BindGroup g_uniformBindGroup;
+wgpu::BindGroupLayout g_vertexUniformBindGroupLayout;
+wgpu::BindGroup g_vertexUniformBindGroup;
+
+// The gxcore vertex block's three bindings over `buffer`, each its part's size.
+static wgpu::BindGroup vertex_uniform_bind_group(const wgpu::Buffer& buffer, const char* label) {
+  namespace gxc = gxruntime::gxcore;
+  const std::array entries{
+      wgpu::BindGroupEntry{.binding = 0, .buffer = buffer, .size = gxc::kVertexBlockBytes},
+      wgpu::BindGroupEntry{.binding = 1, .buffer = buffer, .size = gxc::kVertexMatrixBytes},
+      wgpu::BindGroupEntry{.binding = 2, .buffer = buffer, .size = gxc::kVertexLightBytes},
+  };
+  const wgpu::BindGroupDescriptor descriptor{
+      .label = label,
+      .layout = g_vertexUniformBindGroupLayout,
+      .entryCount = entries.size(),
+      .entries = entries.data(),
+  };
+  return g_device.CreateBindGroup(&descriptor);
+}
 
 // for imgui debug
 AuroraStats g_stats{};
@@ -324,6 +343,7 @@ static int g_replayStep = 0;          // render worker: which of its in-between 
 static uint64_t g_interpUniformOverflows = 0; // recording thread
 static wgpu::Buffer g_interpUniformBuffer;
 wgpu::BindGroup g_interpUniformBindGroup;
+wgpu::BindGroup g_interpVertexUniformBindGroup;
 static FramePacket* g_recordingFrame = nullptr;
 static size_t g_recordingFrameSlot = 0;
 static uint64_t g_nextFrameId = 1;
@@ -1263,6 +1283,26 @@ void initialize() {
     };
     g_uniformBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
   }
+  {
+    std::array<wgpu::BindGroupLayoutEntry, 3> layoutEntries{};
+    for (uint32_t i = 0; i < layoutEntries.size(); ++i)
+      layoutEntries[i] = wgpu::BindGroupLayoutEntry{
+          .binding = i,
+          .visibility = wgpu::ShaderStage::Vertex | wgpu::ShaderStage::Fragment,
+          .buffer =
+              wgpu::BufferBindingLayout{
+                  .type = wgpu::BufferBindingType::Uniform,
+                  .hasDynamicOffset = true,
+              },
+      };
+    const wgpu::BindGroupLayoutDescriptor layoutDesc{
+        .label = "GXCore vertex uniform bind group layout",
+        .entryCount = layoutEntries.size(),
+        .entries = layoutEntries.data(),
+    };
+    g_vertexUniformBindGroupLayout = g_device.CreateBindGroupLayout(&layoutDesc);
+    g_vertexUniformBindGroup = vertex_uniform_bind_group(g_uniformBuffer, "GXCore vertex uniform bind group");
+  }
 
   gx::initialize();
 #ifdef AURORA_ENABLE_RMLUI
@@ -1284,6 +1324,7 @@ void shutdown() {
       held = {};
   g_lastDue = {};
   g_interpUniformBindGroup = {};
+  g_interpVertexUniformBindGroup = {};
   g_interpUniformBuffer = {};
   g_interpUniformBufferSize = 0;
   g_interpVertexBuffer = {};
@@ -1343,6 +1384,8 @@ void shutdown() {
   g_staticBindGroupLayout = {};
   g_uniformBindGroup = {};
   g_uniformBindGroupLayout = {};
+  g_vertexUniformBindGroup = {};
+  g_vertexUniformBindGroupLayout = {};
   g_inOffscreen = false;
   g_frameIndex = UINT32_MAX;
   g_frameSlots.reset();
@@ -2170,6 +2213,8 @@ static void upload_interp_data(size_t frameSlot) {
         .entries = entries.data(),
     };
     g_interpUniformBindGroup = g_device.CreateBindGroup(&bindGroupDescriptor);
+    g_interpVertexUniformBindGroup =
+        vertex_uniform_bind_group(g_interpUniformBuffer, "In-between frame vertex uniform bind group");
   }
   if (vertexBytes != 0 && (!g_interpVertexBuffer || g_interpVertexBufferSize < vertexBytes)) {
     const uint64_t wanted = std::max(vertexBytes, InterpVertexStartSize);

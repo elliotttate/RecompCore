@@ -135,15 +135,21 @@ struct VertexShaderConstants {
     posnormalmatrix: array<vec4f, 6>,
     projection: array<vec4f, 4>,
     texmatrices: array<vec4f, 24>,
-    transformmatrices: array<vec4f, 64>,
-    lights: array<Light, 8>,
     materials: array<vec4i, 4>,
     cached_normal: vec4f,
     cached_tangent: vec4f,
     cached_binormal: vec4f,
-    normalmatrices: array<vec4f, 32>,
 };
 @group(1) @binding(0) var<uniform> vsc: VertexShaderConstants;
+struct VertexMatrices {
+    transformmatrices: array<vec4f, 64>,
+    normalmatrices: array<vec4f, 32>,
+};
+@group(1) @binding(1) var<uniform> vsm: VertexMatrices;
+struct VertexLights {
+    lights: array<Light, 8>,
+};
+@group(1) @binding(2) var<uniform> vsl: VertexLights;
 // The pixel constants, then the draw's shader key and what the CPU derived
 // from it (extra.x: more than one texmap, sampled where each is bound).
 struct PixelShaderConstants {
@@ -268,24 +274,24 @@ fn light_term(i: u32, ch: u32, pos: vec3f, _normal: vec3f) -> f32 {
     var ldir: vec3f;
     var attn: f32;
     if (attnfn == 0u || attnfn == 2u) {
-        ldir = normalize(vsc.lights[i].pos.xyz - pos);
+        ldir = normalize(vsl.lights[i].pos.xyz - pos);
         attn = 1.0;
         if (length(ldir) == 0.0) { ldir = _normal; }
     } else if (attnfn == 1u) {
-        ldir = normalize(vsc.lights[i].pos.xyz - pos);
-        attn = select(0.0, max(0.0, dot(_normal, vsc.lights[i].dir.xyz)), dot(_normal, ldir) >= 0.0);
-        let cosAttn = vsc.lights[i].cosatt.xyz;
+        ldir = normalize(vsl.lights[i].pos.xyz - pos);
+        attn = select(0.0, max(0.0, dot(_normal, vsl.lights[i].dir.xyz)), dot(_normal, ldir) >= 0.0);
+        let cosAttn = vsl.lights[i].cosatt.xyz;
         var distAttn: vec3f;
-        if (diff == 0u) { distAttn = vsc.lights[i].distatt.xyz; } else { distAttn = normalize(vsc.lights[i].distatt.xyz); }
+        if (diff == 0u) { distAttn = vsl.lights[i].distatt.xyz; } else { distAttn = normalize(vsl.lights[i].distatt.xyz); }
         attn = max(0.0, dot(cosAttn, vec3f(1.0, attn, attn*attn))) / dot(distAttn, vec3f(1.0, attn, attn*attn));
     } else {
-        ldir = vsc.lights[i].pos.xyz - pos;
+        ldir = vsl.lights[i].pos.xyz - pos;
         let dist2 = dot(ldir, ldir);
         let dist = sqrt(dist2);
         ldir = ldir / dist;
-        attn = max(0.0, dot(ldir, vsc.lights[i].dir.xyz));
-        attn = max(0.0, vsc.lights[i].cosatt.x + vsc.lights[i].cosatt.y*attn + vsc.lights[i].cosatt.z*attn*attn) /
-               dot(vsc.lights[i].distatt.xyz, vec3f(1.0, dist, dist2));
+        attn = max(0.0, dot(ldir, vsl.lights[i].dir.xyz));
+        attn = max(0.0, vsl.lights[i].cosatt.x + vsl.lights[i].cosatt.y*attn + vsl.lights[i].cosatt.z*attn*attn) /
+               dot(vsl.lights[i].distatt.xyz, vec3f(1.0, dist, dist2));
     }
     if (diff == 1u) { return attn * (dot(ldir, _normal)); }
     if (diff == 2u) { return attn * max(0.0, dot(ldir, _normal)); }
@@ -321,7 +327,7 @@ fn calc_lighting(j: u32, base_color: vec4f, pos: vec3f, _normal: vec3f) -> vec4f
         for (var i = 0u; i < 8u; i++) {
             if (((mask >> i) & 1u) != 0u) {
                 let t = light_term(i, col, pos, _normal);
-                lacc = lacc + vec4i(vec3i(round(t * vec3f(vsc.lights[i].color.rgb))), 0);
+                lacc = lacc + vec4i(vec3i(round(t * vec3f(vsl.lights[i].color.rgb))), 0);
             }
         }
     }
@@ -330,7 +336,7 @@ fn calc_lighting(j: u32, base_color: vec4f, pos: vec3f, _normal: vec3f) -> vec4f
         for (var i = 0u; i < 8u; i++) {
             if (((mask >> i) & 1u) != 0u) {
                 let t = light_term(i, alp, pos, _normal);
-                lacc.a = lacc.a + i32(round(t * f32(vsc.lights[i].color.a)));
+                lacc.a = lacc.a + i32(round(t * f32(vsl.lights[i].color.a)));
             }
         }
     }
@@ -356,9 +362,9 @@ fn vs_main(in: VertexIn) -> VertexOut {
     var p2: vec4f;
     if (has_posidx) {
         posidx = i32(in.posmtx);
-        p0 = vsc.transformmatrices[posidx];
-        p1 = vsc.transformmatrices[posidx + 1];
-        p2 = vsc.transformmatrices[posidx + 2];
+        p0 = vsm.transformmatrices[posidx];
+        p1 = vsm.transformmatrices[posidx + 1];
+        p2 = vsm.transformmatrices[posidx + 2];
         normidx = posidx & 31;
     } else {
         p0 = vsc.posnormalmatrix[0];
@@ -390,9 +396,9 @@ fn vs_main(in: VertexIn) -> VertexOut {
     var _normal = vec3f(0.0, 0.0, 1.0);
     if ((lit0 || lit1) && lit) {
         if (needs_normal_bank) {
-            _normal = normalize(vec3f(dot(vsc.normalmatrices[normidx].xyz, normal_in),
-                                      dot(vsc.normalmatrices[normidx + 1].xyz, normal_in),
-                                      dot(vsc.normalmatrices[normidx + 2].xyz, normal_in)));
+            _normal = normalize(vec3f(dot(vsm.normalmatrices[normidx].xyz, normal_in),
+                                      dot(vsm.normalmatrices[normidx + 1].xyz, normal_in),
+                                      dot(vsm.normalmatrices[normidx + 2].xyz, normal_in)));
         } else {
             _normal = normalize(vec3f(dot(vsc.posnormalmatrix[3].xyz, normal_in),
                                       dot(vsc.posnormalmatrix[4].xyz, normal_in),
@@ -433,9 +439,9 @@ fn vs_main(in: VertexIn) -> VertexOut {
                 var ti: u32;
                 if (i < 4u) { ti = (in.texmtxidx >> (8u * i)) & 0xFFu; }
                 else { ti = (in.texmtxidx_hi >> (8u * (i - 4u))) & 0xFFu; }
-                let m0 = vsc.transformmatrices[ti];
-                let m1 = vsc.transformmatrices[ti + 1u];
-                let m2 = vsc.transformmatrices[ti + 2u];
+                let m0 = vsm.transformmatrices[ti];
+                let m1 = vsm.transformmatrices[ti + 1u];
+                let m2 = vsm.transformmatrices[ti + 2u];
                 if (proj) { uv = vec3f(dot(coord, m0), dot(coord, m1), dot(coord, m2)); }
                 else { uv = vec3f(dot(coord, m0), dot(coord, m1), 1.0); }
             } else if (proj) {
@@ -454,19 +460,19 @@ fn vs_main(in: VertexIn) -> VertexOut {
             var tn: vec3f;
             var bn: vec3f;
             if (needs_normal_bank) {
-                tn = vec3f(dot(vsc.normalmatrices[normidx].xyz, tangent_in),
-                           dot(vsc.normalmatrices[normidx + 1].xyz, tangent_in),
-                           dot(vsc.normalmatrices[normidx + 2].xyz, tangent_in));
-                bn = vec3f(dot(vsc.normalmatrices[normidx].xyz, binormal_in),
-                           dot(vsc.normalmatrices[normidx + 1].xyz, binormal_in),
-                           dot(vsc.normalmatrices[normidx + 2].xyz, binormal_in));
+                tn = vec3f(dot(vsm.normalmatrices[normidx].xyz, tangent_in),
+                           dot(vsm.normalmatrices[normidx + 1].xyz, tangent_in),
+                           dot(vsm.normalmatrices[normidx + 2].xyz, tangent_in));
+                bn = vec3f(dot(vsm.normalmatrices[normidx].xyz, binormal_in),
+                           dot(vsm.normalmatrices[normidx + 1].xyz, binormal_in),
+                           dot(vsm.normalmatrices[normidx + 2].xyz, binormal_in));
             } else {
                 tn = vec3f(dot(vsc.posnormalmatrix[3].xyz, tangent_in), dot(vsc.posnormalmatrix[4].xyz, tangent_in),
                            dot(vsc.posnormalmatrix[5].xyz, tangent_in));
                 bn = vec3f(dot(vsc.posnormalmatrix[3].xyz, binormal_in), dot(vsc.posnormalmatrix[4].xyz, binormal_in),
                            dot(vsc.posnormalmatrix[5].xyz, binormal_in));
             }
-            let ld = normalize(vsc.lights[kb(tg + TG_embosslightshift)].pos.xyz - viewpos.xyz);
+            let ld = normalize(vsl.lights[kb(tg + TG_embosslightshift)].pos.xyz - viewpos.xyz);
             uvs[i] = uvs[min(kb(tg + TG_embosssourceshift), 4u)] + vec3f(dot(ld, tn), dot(ld, bn), 0.0);
         }
     }

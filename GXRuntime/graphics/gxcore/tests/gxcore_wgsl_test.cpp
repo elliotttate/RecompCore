@@ -6,8 +6,11 @@
 
 #include "gxruntime/gxcore/gxcore.hpp"
 
+#include <cctype>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -44,6 +47,68 @@ ar::RenderStatePacket bp(std::uint32_t reg, std::uint32_t value) {
   return {.kind = ar::RenderStateKind::BpReg, .index = reg, .value = value};
 }
 
+// Every field of the three vertex uniform parts the shader reads lies within
+// the bytes vertex_uniform_use says a draw stages of that part: a literal index
+// reads up to that element, any other the whole field.
+void check_vertex_uniform_reads(const gxc::ShaderKey& key, const std::string& wgsl) {
+  struct Field {
+    const char* binding;
+    const char* name;
+    std::size_t offset, size, stride;
+  };
+  using C = gxc::VertexShaderConstants;
+  const std::size_t m = gxc::kVertexMatrixOffset;
+  const std::size_t l = gxc::kVertexLightOffset;
+  static const Field fields[] = {
+      {"vsc", "posnormalmatrix", offsetof(C, posnormalmatrix), sizeof(C::posnormalmatrix), 16},
+      {"vsc", "projection", offsetof(C, projection), sizeof(C::projection), 16},
+      {"vsc", "texmatrices", offsetof(C, texmatrices), sizeof(C::texmatrices), 16},
+      {"vsc", "materials", offsetof(C, materials), sizeof(C::materials), 16},
+      {"vsc", "cached_normal", offsetof(C, cached_normal), 16, 16},
+      {"vsc", "cached_tangent", offsetof(C, cached_tangent), 16, 16},
+      {"vsc", "cached_binormal", offsetof(C, cached_binormal), 16, 16},
+      {"vsm", "transformmatrices", offsetof(C, transformmatrices) - m, sizeof(C::transformmatrices), 16},
+      {"vsm", "normalmatrices", offsetof(C, normalmatrices) - m, sizeof(C::normalmatrices), 16},
+      {"vsl", "lights", offsetof(C, lights) - l, sizeof(C::lights), sizeof(C::lights[0])},
+  };
+  const gxc::VertexUniformUse use = gxc::vertex_uniform_use(key);
+  for (const char* binding : {"vsc", "vsm", "vsl"}) {
+    const std::size_t staged = binding[2] == 'c' ? use.block : binding[2] == 'm' ? use.matrices : use.lights;
+    const std::string prefix = std::string(binding) + ".";
+    std::size_t at = 0;
+    while ((at = wgsl.find(prefix, at)) != std::string::npos) {
+      at += prefix.size();
+      std::size_t end = at;
+      while (end < wgsl.size() && (std::isalnum(static_cast<unsigned char>(wgsl[end])) || wgsl[end] == '_'))
+        ++end;
+      const std::string name = wgsl.substr(at, end - at);
+      const Field* field = nullptr;
+      for (const Field& f : fields)
+        if (name == f.name && std::strcmp(binding, f.binding) == 0)
+          field = &f;
+      CHECK(field != nullptr);
+      if (field == nullptr)
+        continue;
+      std::size_t read = field->offset + field->size;
+      if (end < wgsl.size() && wgsl[end] == '[') {
+        char* stop = nullptr;
+        const unsigned long index = std::strtoul(wgsl.c_str() + end + 1, &stop, 10);
+        if (stop != wgsl.c_str() + end + 1 && *stop == ']')
+          read = field->offset + (index + 1) * field->stride;
+      }
+      if (read > staged)
+        std::fprintf(stderr, "%s.%s read to byte %zu, staged %zu\n", binding, name.c_str(), read, staged);
+      CHECK(read <= staged);
+    }
+  }
+}
+
+std::string checked_wgsl(const gxc::ShaderKey& key) {
+  std::string wgsl = gxc::generate_wgsl(key);
+  check_vertex_uniform_reads(key, wgsl);
+  return wgsl;
+}
+
 // The golden WGSL for the textured 1-texgen key below. Regenerate by running
 // this test with GXCORE_PRINT_WGSL=1 in the environment and pasting stdout.
 constexpr const char* kGoldenTexturedWgsl =
@@ -52,7 +117,6 @@ struct VertexShaderConstants {
     posnormalmatrix: array<vec4f, 6>,
     projection: array<vec4f, 4>,
     texmatrices: array<vec4f, 24>,
-    transformmatrices: array<vec4f, 64>,
 };
 @group(1) @binding(0) var<uniform> vsc: VertexShaderConstants;
 @group(2) @binding(0) var tex0: texture_2d<f32>;
@@ -274,7 +338,7 @@ void test_state_to_plan_and_wgsl() {
     CHECK(dst_plan.pipeline.shader.dst_alpha == 0x5Au);
     CHECK(gaps.dst_alpha_active == 1u);
     const std::string dst_wgsl =
-        gxc::generate_wgsl(dst_plan.pipeline.shader);
+        checked_wgsl(dst_plan.pipeline.shader);
     CHECK(dst_wgsl.find("@location(0) @blend_src(0) color") !=
           std::string::npos);
     CHECK(dst_wgsl.find("@location(0) @blend_src(1) blend") !=
@@ -497,7 +561,7 @@ void test_state_to_plan_and_wgsl() {
   CHECK(plan.viewport_valid);
 
   // WGSL golden.
-  const std::string wgsl = gxc::generate_wgsl(key);
+  const std::string wgsl = checked_wgsl(key);
   if (std::getenv("GXCORE_PRINT_WGSL") != nullptr)
     std::printf("%s", wgsl.c_str());
   if (wgsl != kGoldenTexturedWgsl) {
@@ -512,15 +576,15 @@ void test_untextured_defaults() {
   gxc::ShaderKey key{};
   key.num_tex_gens = 0;
   key.has_color0 = 1;
-  const std::string wgsl = gxc::generate_wgsl(key);
+  const std::string wgsl = checked_wgsl(key);
   CHECK(wgsl.find("@group(2)") == std::string::npos);
   CHECK(wgsl.find("o.color0 = in.rawcolor0;") != std::string::npos);
   CHECK(wgsl.find("textureSample") == std::string::npos);
   // Per-vertex position matrix variant.
   gxc::ShaderKey pnkey{};
   pnkey.has_pos_mtx_idx = 1;
-  const std::string pn = gxc::generate_wgsl(pnkey);
-  CHECK(pn.find("vsc.transformmatrices[posidx]") != std::string::npos);
+  const std::string pn = checked_wgsl(pnkey);
+  CHECK(pn.find("vsm.transformmatrices[posidx]") != std::string::npos);
 }
 
 // Item 5: the vertex decoder packs the per-vertex TEXMTXIDX byte into the fixed
@@ -618,7 +682,7 @@ void test_texgen_color() {
   key.tex_gens[0].texgentype = static_cast<std::uint8_t>(gxc::TexGenType::Color0);
   key.tex_gens[1].enabled = 1;
   key.tex_gens[1].texgentype = static_cast<std::uint8_t>(gxc::TexGenType::Color1);
-  const std::string w = gxc::generate_wgsl(key);
+  const std::string w = checked_wgsl(key);
   CHECK(w.find("@location(1) color1: vec4f,") != std::string::npos);
   CHECK(w.find("o.uv0 = vec3f(o.color0.x, o.color0.y, 1.0);") !=
         std::string::npos);
@@ -638,14 +702,14 @@ void test_texgen_normal_source() {
   key.tex_gens[0].texgentype = static_cast<std::uint8_t>(gxc::TexGenType::Regular);
   key.tex_gens[0].sourcerow = static_cast<std::uint8_t>(gxc::TexSourceRow::Normal);
   key.has_vertex_normal = 1;
-  const std::string with_normal = gxc::generate_wgsl(key);
+  const std::string with_normal = checked_wgsl(key);
   CHECK(with_normal.find("@location(8) rawnormal: vec3f") !=
         std::string::npos);
   CHECK(with_normal.find("coord = vec4f(in.rawnormal, 1.0);") !=
         std::string::npos);
 
   key.has_vertex_normal = 0;
-  const std::string without_normal = gxc::generate_wgsl(key);
+  const std::string without_normal = checked_wgsl(key);
   CHECK(without_normal.find("coord = vec4f(in.rawnormal, 1.0);") ==
         std::string::npos);
 }
@@ -677,7 +741,7 @@ void test_five_texgens() {
   key.tev_stages[0].tevorders_texmap = 0;
   key.tev_stages[0].tevorders_texcoord = 4;
 
-  const std::string w = gxc::generate_wgsl(key);
+  const std::string w = checked_wgsl(key);
   CHECK(w.find("@location(12) rawtex4: vec2f") != std::string::npos);
   CHECK(w.find("@location(13) texmtxidx_hi: u32") != std::string::npos);
   CHECK(w.find("@location(6) uv4: vec3f") != std::string::npos);
@@ -1004,13 +1068,13 @@ void test_texgen_emboss() {
       static_cast<std::uint8_t>(gxc::TexGenType::EmbossMap);
   key.tex_gens[1].embosssourceshift = 0; // source = texgen 0
   key.tex_gens[1].embosslightshift = 2;  // light index 2
-  const std::string w = gxc::generate_wgsl(key);
+  const std::string w = checked_wgsl(key);
   CHECK(w.find("struct Light {") != std::string::npos); // emboss forces lights
   CHECK(w.find("lights: array<Light, 8>,") != std::string::npos);
   CHECK(w.find("@location(8) rawnormal: vec3f,") != std::string::npos);
   CHECK(w.find("@location(10) rawbinormal: vec3f,") != std::string::npos);
   CHECK(w.find("@location(11) rawtangent: vec3f,") != std::string::npos);
-  CHECK(w.find("normalize(vsc.lights[2u].pos.xyz - viewpos.xyz)") !=
+  CHECK(w.find("normalize(vsl.lights[2u].pos.xyz - viewpos.xyz)") !=
         std::string::npos);
   // uv1 (emboss) offsets uv0 (its source texgen).
   CHECK(w.find("o.uv1 = o.uv0 + vec3f(dot(ld1, tn1), dot(ld1, bn1), 0.0);") !=
@@ -1026,17 +1090,17 @@ void test_texgen_per_vertex_mtx() {
   key.tex_mtx_idx_mask = 0x1; // texgen 0 carries the attribute
   key.tex_gens[0].enabled = 1;
   key.tex_gens[0].texgentype = static_cast<std::uint8_t>(gxc::TexGenType::Regular);
-  const std::string w = gxc::generate_wgsl(key);
+  const std::string w = checked_wgsl(key);
   CHECK(w.find("@location(9) texmtxidx: u32,") != std::string::npos);
   CHECK(w.find("(in.texmtxidx >> (8u * 0u)) & 0xFFu") != std::string::npos);
-  CHECK(w.find("vsc.transformmatrices[ti0]") != std::string::npos);
+  CHECK(w.find("vsm.transformmatrices[ti0]") != std::string::npos);
   // A texgen NOT in the mask keeps the static slot.
   gxc::ShaderKey key2{};
   key2.num_tex_gens = 1;
   key2.has_tex_mtx_idx = 1;
   key2.tex_mtx_idx_mask = 0x0; // texgen 0 does not carry it
   key2.tex_gens[0].enabled = 1;
-  const std::string w2 = gxc::generate_wgsl(key2);
+  const std::string w2 = checked_wgsl(key2);
   CHECK(w2.find("vsc.texmatrices[0]") != std::string::npos);
   CHECK(w2.find("in.texmtxidx") == std::string::npos);
 }
@@ -1058,7 +1122,7 @@ void test_tev_indirect_matrix() {
   key.tev_stages[0].ind_matrix_index = 1;
 
   CHECK(gxc::used_texmap_mask(key) == 0x3u);
-  const std::string w = gxc::generate_wgsl(key);
+  const std::string w = checked_wgsl(key);
   CHECK(w.find("indtexmtx: array<vec4i, 6>") != std::string::npos);
   CHECK(w.find("textureSample(tex1, samp1, ind_uv0).abg") !=
         std::string::npos);
@@ -1078,7 +1142,7 @@ void test_tev_texcoord_scale() {
   key.tev_stages[0].tevorders_texmap = 0;
   key.tev_stages[0].tevorders_texcoord = 0;
 
-  const std::string w = gxc::generate_wgsl(key);
+  const std::string w = checked_wgsl(key);
   CHECK(w.find("texdims: array<vec4i, 8>") != std::string::npos);
   CHECK(w.find("vec2i(in.uv0.xy * vec2f(psc.texdims[0].zw * 128))") !=
         std::string::npos);
@@ -1098,7 +1162,6 @@ struct VertexShaderConstants {
     posnormalmatrix: array<vec4f, 6>,
     projection: array<vec4f, 4>,
     texmatrices: array<vec4f, 24>,
-    transformmatrices: array<vec4f, 64>,
 };
 @group(1) @binding(0) var<uniform> vsc: VertexShaderConstants;
 struct PixelShaderConstants {
@@ -1337,7 +1400,7 @@ void test_tev_modulate() {
   CHECK(plan.pixel_constants.kcolors[0][2] == 20);
   CHECK(plan.pixel_constants.kcolors[0][3] == 40);
 
-  const std::string wgsl = gxc::generate_wgsl(key);
+  const std::string wgsl = checked_wgsl(key);
   if (std::getenv("GXCORE_PRINT_WGSL") != nullptr)
     std::printf("%s", wgsl.c_str());
   if (wgsl != kGoldenTevWgsl) {
@@ -1360,7 +1423,7 @@ void test_tev_modulate() {
   CHECK(ztex_plan.pixel_constants.zbias[3] == 0x1234);
   CHECK(ztex_counters.ztexture_active == 1u);
   CHECK(ztex_counters.ztexture_ignored == 0u);
-  const std::string ztex_wgsl = gxc::generate_wgsl(ztex_plan.pipeline.shader);
+  const std::string ztex_wgsl = checked_wgsl(ztex_plan.pipeline.shader);
   CHECK(ztex_wgsl.find("@builtin(frag_depth)") != std::string::npos);
   CHECK(ztex_wgsl.find("rawtextemp.r * 65536") != std::string::npos);
   CHECK(ztex_wgsl.find("+ psc.zbias.w") != std::string::npos);
@@ -1389,7 +1452,7 @@ void test_tev_konst_and_alpha() {
   s.ksel_kc = 0x0C; // K0 rgb
   s.ksel_ka = 0x1C; // K0 a
   s.tevorders_enable = 1;
-  const std::string wgsl = gxc::generate_wgsl(key);
+  const std::string wgsl = checked_wgsl(key);
   CHECK(wgsl.find("konsttemp = vec4i(psc.kcolors[0].rgb, psc.kcolors[0].a);") !=
         std::string::npos);
   CHECK(wgsl.find("if (!( (prev.a > psc.alpha_ref.x) && (true) )) { discard; }") !=
@@ -1402,6 +1465,13 @@ void test_tev_konst_and_alpha() {
 // no texgens, TEV off. Regenerate with GXCORE_PRINT_WGSL=1.
 constexpr const char* kGoldenLitWgsl =
     R"(// gxcore generated shader (Dolphin VertexShaderGen shape)
+struct VertexShaderConstants {
+    posnormalmatrix: array<vec4f, 6>,
+    projection: array<vec4f, 4>,
+    texmatrices: array<vec4f, 24>,
+    materials: array<vec4i, 4>,
+};
+@group(1) @binding(0) var<uniform> vsc: VertexShaderConstants;
 struct Light {
     color: vec4i,
     cosatt: vec4f,
@@ -1409,15 +1479,10 @@ struct Light {
     pos: vec4f,
     dir: vec4f,
 };
-struct VertexShaderConstants {
-    posnormalmatrix: array<vec4f, 6>,
-    projection: array<vec4f, 4>,
-    texmatrices: array<vec4f, 24>,
-    transformmatrices: array<vec4f, 64>,
+struct VertexLights {
     lights: array<Light, 8>,
-    materials: array<vec4i, 4>,
 };
-@group(1) @binding(0) var<uniform> vsc: VertexShaderConstants;
+@group(1) @binding(2) var<uniform> vsl: VertexLights;
 struct VertexIn {
     @location(0) rawpos: vec3f,
     @location(1) posmtx: u32,
@@ -1447,10 +1512,10 @@ fn calc_lighting_chn0(base_color: vec4f, pos: vec3f, _normal: vec3f) -> vec4f {
     lacc = vsc.materials[0];
     lacc.w = 255;
         { // light 0
-            ldir = normalize(vsc.lights[0].pos.xyz - pos);
+            ldir = normalize(vsl.lights[0].pos.xyz - pos);
             attn = 1.0;
             if (length(ldir) == 0.0) { ldir = _normal; }
-            lacc = lacc + vec4i(vec3i(round(attn * max(0.0, dot(ldir, _normal)) * vec3f(vsc.lights[0].color.rgb))), 0);
+            lacc = lacc + vec4i(vec3i(round(attn * max(0.0, dot(ldir, _normal)) * vec3f(vsl.lights[0].color.rgb))), 0);
         }
     lacc = clamp(lacc, vec4<i32>(0), vec4<i32>(255));
     return vec4f((mat * (lacc + (lacc >> vec4u(7)))) >> vec4u(8)) / 255.0;
@@ -1615,7 +1680,7 @@ void test_lighting() {
   CHECK(plan.constants.normalmatrices[8][2] == 28.f);
   CHECK(plan.constants.normalmatrices[8][3] == 0.f);
 
-  const std::string wgsl = gxc::generate_wgsl(key);
+  const std::string wgsl = checked_wgsl(key);
   if (std::getenv("GXCORE_PRINT_WGSL") != nullptr)
     std::printf("%s", wgsl.c_str());
   // Structural checks (oracle-verifiable) in addition to the byte golden.
@@ -1627,8 +1692,8 @@ void test_lighting() {
   CHECK(wgsl.find("mat = vec4i(round(base_color * 255.0));") != std::string::npos);
   CHECK(wgsl.find("lacc = vsc.materials[0];") != std::string::npos); // ambsource Register
   CHECK(wgsl.find("lacc.w = 255;") != std::string::npos);            // alpha lighting off
-  CHECK(wgsl.find("ldir = normalize(vsc.lights[0].pos.xyz - pos);") != std::string::npos);
-  CHECK(wgsl.find("max(0.0, dot(ldir, _normal)) * vec3f(vsc.lights[0].color.rgb)") !=
+  CHECK(wgsl.find("ldir = normalize(vsl.lights[0].pos.xyz - pos);") != std::string::npos);
+  CHECK(wgsl.find("max(0.0, dot(ldir, _normal)) * vec3f(vsl.lights[0].color.rgb)") !=
         std::string::npos);
   CHECK(wgsl.find("o.color0 = calc_lighting_chn0(in.rawcolor0, viewpos.xyz, _normal);") !=
         std::string::npos);
@@ -1662,7 +1727,7 @@ void test_lighting_spot_and_matw() {
   key.litchan[2].matsource = 1; // Vertex (differs from color -> mat.w override)
   key.litchan[2].attnfunc = 1;  // Spec
   key.litchan[2].light_mask = 0x1;
-  const std::string wgsl = gxc::generate_wgsl(key);
+  const std::string wgsl = checked_wgsl(key);
   // Channel 1 is unconfigured, so its lighting function is not emitted even with
   // TEV on; o.color1 passes the vertex color through (identical to running the
   // unlit lighting function). The spot/spec math below lives in chn0.
@@ -1675,7 +1740,7 @@ void test_lighting_spot_and_matw() {
   CHECK(wgsl.find("lacc = vec4i(round(base_color * 255.0));") != std::string::npos); // ambsource Vertex
   CHECK(wgsl.find("(dot(ldir, _normal)) * vec3f") != std::string::npos); // Sign (no max)
   // Spec alpha light: select() attenuation.
-  CHECK(wgsl.find("attn = select(0.0, max(0.0, dot(_normal, vsc.lights[0].dir.xyz))") !=
+  CHECK(wgsl.find("attn = select(0.0, max(0.0, dot(_normal, vsl.lights[0].dir.xyz))") !=
         std::string::npos);
 }
 
@@ -1696,14 +1761,14 @@ void test_lighting_completeness() {
     key.litchan[0].enablelighting = 0;
     key.litchan[0].matsource = 0; // Register
     key.litchan[2].matsource = 0; // Register (alpha)
-    const std::string wgsl = gxc::generate_wgsl(key);
+    const std::string wgsl = checked_wgsl(key);
     CHECK(wgsl.find("fn calc_lighting_chn0(") != std::string::npos);
     CHECK(wgsl.find("materials: array<vec4i, 4>,") != std::string::npos);
     CHECK(wgsl.find("@location(8) rawnormal: vec3f,") == std::string::npos);
     CHECK(wgsl.find("let _normal = vec3f(0.0, 0.0, 1.0);") != std::string::npos);
     CHECK(wgsl.find("mat = vsc.materials[2];") != std::string::npos); // register mat
     CHECK(wgsl.find("lacc = vec4i(255, 255, 255, 255);") != std::string::npos); // unlit seed
-    CHECK(wgsl.find("vsc.lights[") == std::string::npos); // no light loop body
+    CHECK(wgsl.find("vsl.lights[") == std::string::npos); // no light loop body
     CHECK(wgsl.find("o.color0 = calc_lighting_chn0(in.rawcolor0, viewpos.xyz, _normal);") !=
           std::string::npos);
   }
@@ -1717,7 +1782,7 @@ void test_lighting_completeness() {
     key.has_color1 = 1;
     key.tev_valid = 1; // emit color1 varying
     key.num_tev_stages = 1;
-    const std::string wgsl = gxc::generate_wgsl(key);
+    const std::string wgsl = checked_wgsl(key);
     CHECK(wgsl.find("fn calc_lighting_chn0(") == std::string::npos); // passthrough
     CHECK(wgsl.find("o.color0 = in.rawcolor1;") != std::string::npos); // fallback
     CHECK(wgsl.find("o.color1 = vec4f(1.0);") != std::string::npos);   // missing
@@ -1728,7 +1793,7 @@ void test_lighting_completeness() {
     gxc::ShaderKey key{};
     key.num_color_chans = 0;
     key.has_color0 = 1;
-    const std::string wgsl = gxc::generate_wgsl(key);
+    const std::string wgsl = checked_wgsl(key);
     CHECK(wgsl.find("o.color0 = in.rawcolor0;") != std::string::npos);
     CHECK(wgsl.find("o.color0 = vec4f(0.0);") != std::string::npos);
   }
@@ -1750,7 +1815,7 @@ void test_cached_normal() {
     key.litchan[0].attnfunc = 2; // Dir
     key.litchan[0].diffusefunc = 2;
     key.litchan[0].light_mask = 0x1;
-    const std::string wgsl = gxc::generate_wgsl(key);
+    const std::string wgsl = checked_wgsl(key);
     // No per-vertex normal input; the cached uniform field is declared instead.
     CHECK(wgsl.find("@location(8) rawnormal: vec3f,") == std::string::npos);
     CHECK(wgsl.find("cached_normal: vec4f,") != std::string::npos);
@@ -1764,7 +1829,7 @@ void test_cached_normal() {
     // field (existing goldens stay byte-identical).
     gxc::ShaderKey key2 = key;
     key2.has_vertex_normal = 1;
-    const std::string wgsl2 = gxc::generate_wgsl(key2);
+    const std::string wgsl2 = checked_wgsl(key2);
     CHECK(wgsl2.find("@location(8) rawnormal: vec3f,") != std::string::npos);
     CHECK(wgsl2.find("cached_normal: vec4f,") == std::string::npos);
     CHECK(wgsl2.find("dot(vsc.posnormalmatrix[3].xyz, in.rawnormal)") !=
@@ -1774,12 +1839,12 @@ void test_cached_normal() {
     // uses (posidx & 31) to address I_NORMALMATRICES; the draw-wide current
     // normal matrix is only valid when PNMTXIDX is absent.
     key2.has_pos_mtx_idx = 1;
-    const std::string per_vertex_wgsl = gxc::generate_wgsl(key2);
+    const std::string per_vertex_wgsl = checked_wgsl(key2);
     CHECK(per_vertex_wgsl.find("normalmatrices: array<vec4f, 32>,") !=
           std::string::npos);
     CHECK(per_vertex_wgsl.find("let normidx = posidx & 31;") !=
           std::string::npos);
-    CHECK(per_vertex_wgsl.find("dot(vsc.normalmatrices[normidx].xyz, in.rawnormal)") !=
+    CHECK(per_vertex_wgsl.find("dot(vsm.normalmatrices[normidx].xyz, in.rawnormal)") !=
           std::string::npos);
   }
 
@@ -1883,7 +1948,7 @@ void test_cached_normal() {
   CHECK(std::fabs(plan_b.constants.cached_normal[0] - 0.f) < 1e-4f);
   CHECK(std::fabs(plan_b.constants.cached_normal[1] - 1.f) < 1e-4f);
   CHECK(std::fabs(plan_b.constants.cached_normal[2] - 0.f) < 1e-4f);
-  const std::string wgsl_b = gxc::generate_wgsl(plan_b.pipeline.shader);
+  const std::string wgsl_b = checked_wgsl(plan_b.pipeline.shader);
   CHECK(wgsl_b.find("vsc.cached_normal.xyz") != std::string::npos);
   CHECK(wgsl_b.find("in.rawnormal") == std::string::npos);
 }
@@ -1905,7 +1970,7 @@ void test_fog() {
     k.fog_range = range ? 1 : 0;
     return k;
   };
-  const std::string persp = gxc::generate_wgsl(
+  const std::string persp = checked_wgsl(
       fog_key(gxc::FogType::BackwardsExpSq, gxc::FogProjection::Perspective, true));
   // GC zCoord (reversed-Z) + perspective ze + range adjust + BackExpSq curve +
   // integer fog blend — exactly Dolphin PixelShaderGen WriteFog.
@@ -1921,7 +1986,7 @@ void test_fog() {
                    "ifog) >> vec3u(8u), prev.a);") != std::string::npos);
 
   // Orthographic ze, no range adjust.
-  const std::string ortho = gxc::generate_wgsl(
+  const std::string ortho = checked_wgsl(
       fog_key(gxc::FogType::Linear, gxc::FogProjection::Orthographic, false));
   CHECK(ortho.find("var ze = psc.fogf.x * f32(zCoord) / 16777216.0;") !=
         std::string::npos);
@@ -1929,17 +1994,17 @@ void test_fog() {
   CHECK(ortho.find("fogv = 1.0 - exp2") == std::string::npos); // linear: no curve
 
   // Each remaining curve emits its Dolphin table line.
-  CHECK(gxc::generate_wgsl(fog_key(gxc::FogType::Exp,
+  CHECK(checked_wgsl(fog_key(gxc::FogType::Exp,
                                    gxc::FogProjection::Perspective, false))
             .find("fogv = 1.0 - exp2(-8.0 * fogv);") != std::string::npos);
-  CHECK(gxc::generate_wgsl(fog_key(gxc::FogType::ExpSq,
+  CHECK(checked_wgsl(fog_key(gxc::FogType::ExpSq,
                                    gxc::FogProjection::Perspective, false))
             .find("fogv = 1.0 - exp2(-8.0 * fogv * fogv);") != std::string::npos);
-  CHECK(gxc::generate_wgsl(fog_key(gxc::FogType::BackwardsExp,
+  CHECK(checked_wgsl(fog_key(gxc::FogType::BackwardsExp,
                                    gxc::FogProjection::Perspective, false))
             .find("fogv = exp2(-8.0 * (1.0 - fogv));") != std::string::npos);
   // Off => no fog fragment at all.
-  CHECK(gxc::generate_wgsl(fog_key(gxc::FogType::Off,
+  CHECK(checked_wgsl(fog_key(gxc::FogType::Off,
                                    gxc::FogProjection::Perspective, false))
             .find("// Fog (Dolphin WriteFog)") == std::string::npos);
 

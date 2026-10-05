@@ -11,6 +11,7 @@
 // types here — the fork's gxcore_draw module and the headless tests both
 // include this file.
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <type_traits>
@@ -305,15 +306,16 @@ struct GpuLight {
 };
 static_assert(sizeof(GpuLight) == 5 * 16);
 
+// Three parts, each a uniform binding of group 1 (kVertexBlockBytes below):
+// the draw's own fields (vsc), XF matrix memory (vsm) and the lights (vsl).
 struct VertexShaderConstants {
+  // --- The draw's own (binding 0, vsc) ---
   float posnormalmatrix[6][4]{};    // rows 0-2 current pos mtx, 3-5 normal
   float projection[4][4]{};         // row-dot form (VertexShaderGen o.pos)
   float texmatrices[24][4]{};       // hardware max 8 texgens * 3 matrix rows
-  float transformmatrices[64][4]{}; // raw XF matrix memory rows
-  // Lighting (S15): the 8 XF lights and the four material/ambient registers
-  // (Dolphin I_MATERIALS: [0]=ambient0, [1]=ambient1, [2]=material0,
-  // [3]=material1, integer RGBA 0..255). Only read on the lit path.
-  GpuLight lights[8]{};
+  // Lighting (S15): the four material/ambient registers (Dolphin I_MATERIALS:
+  // [0]=ambient0, [1]=ambient1, [2]=material0, [3]=material1, integer RGBA
+  // 0..255). Only read on the lit path, as are the lights below.
   std::int32_t materials[4][4]{};
   // Cached vertex attributes (Dolphin ConstantManager cached_normal/tangent/
   // binormal): the last-decoded vertex's RAW object-space N/B/T, substituted
@@ -322,14 +324,28 @@ struct VertexShaderConstants {
   float cached_normal[4]{0.f, 0.f, 0.f, 0.f};
   float cached_tangent[4]{0.f, 0.f, 0.f, 0.f};
   float cached_binormal[4]{0.f, 0.f, 0.f, 0.f};
+  // --- XF matrix memory (binding 1, vsm) ---
+  float transformmatrices[64][4]{}; // raw XF matrix memory rows
   // Dolphin I_NORMALMATRICES: 32 vec4-aligned rows containing the packed XF
   // 3x3 normal-matrix bank. Per-vertex PNMTXIDX addresses this with
   // (posidx & 31), independently of the draw-wide current matrix above.
   float normalmatrices[32][4]{};
+  // --- The 8 XF lights (binding 2, vsl) ---
+  GpuLight lights[8]{};
 };
 static_assert(sizeof(VertexShaderConstants) ==
               (6 + 4 + 24 + 64) * 16 + 8 * (5 * 16) + 4 * 16 + 3 * 16 +
                   32 * 16);
+// Each part is staged and de-duplicated on its own, from its first field: a
+// draw's own fields change nearly every draw, matrix memory with them, the
+// lights rarely (Wind Waker at sea: 96, 97 and 2 percent of blocks), and most
+// draws read no matrix memory. As one block, every draw staged all 2832 bytes.
+inline constexpr std::uint32_t kVertexBlockBytes = offsetof(VertexShaderConstants, transformmatrices);
+inline constexpr std::uint32_t kVertexMatrixOffset = offsetof(VertexShaderConstants, transformmatrices);
+inline constexpr std::uint32_t kVertexMatrixBytes =
+    offsetof(VertexShaderConstants, lights) - offsetof(VertexShaderConstants, transformmatrices);
+inline constexpr std::uint32_t kVertexLightOffset = offsetof(VertexShaderConstants, lights);
+inline constexpr std::uint32_t kVertexLightBytes = sizeof(VertexShaderConstants) - kVertexLightOffset;
 
 // Pixel-shader uniforms (Dolphin PixelShaderConstants subset): the four TEV
 // color registers (I_COLORS: [0] prev seed, [1..3] c0/c1/c2), the four konst
@@ -644,6 +660,17 @@ struct EfbCopyCommand {
 // group(1)=dynamic uniform, group(2)=texture+sampler.
 std::string generate_wgsl(const ShaderKey& key);
 bool channel_lit_path(const ShaderKey& k, unsigned j);
+// How many leading bytes of each part of VertexShaderConstants
+// generate_wgsl(key) declares (0: it binds none of that part): a draw stages
+// no more. An unlit draw without matrix indices reads its matrix, projection
+// and texgen rows only. gxcore_wgsl_test checks each shader's reads against
+// them.
+struct VertexUniformUse {
+  std::uint32_t block;    // of the draw's own fields (binding 0)
+  std::uint32_t matrices; // of matrix memory (binding 1)
+  std::uint32_t lights;   // of the lights (binding 2)
+};
+VertexUniformUse vertex_uniform_use(const ShaderKey& key);
 
 // The ubershader (gxcore_uber.cpp): one module for any key, which it reads
 // from the pixel uniform (UberPixelConstants), for a draw whose own pipeline
